@@ -79,6 +79,7 @@ Execute::Execute(const std::string &name_,
     setTraceTimeOnCommit(params.executeSetTraceTimeOnCommit),
     setTraceTimeOnIssue(params.executeSetTraceTimeOnIssue),
     allowEarlyMemIssue(params.executeAllowEarlyMemoryIssue),
+    enableLVP(params.enableLVP),
     noCostFUIndex(fuDescriptions.funcUnits.size() + 1),
     lsq(name_ + ".lsq", name_ + ".dcache_port",
         cpu_, *this,
@@ -94,6 +95,11 @@ Execute::Execute(const std::string &name_,
     issuePriority(0),
     commitPriority(0)
 {
+    if (enableLVP) {
+        lvp = std::make_unique<LastValuePredictor>(&cpu_,
+            params.lvpTableEntries, params.lvpConfThreshold);
+    }
+
     if (commitLimit < 1) {
         fatal("%s: executeCommitLimit must be >= 1 (%d)\n", name_,
             commitLimit);

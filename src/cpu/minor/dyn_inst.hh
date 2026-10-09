@@ -223,6 +223,17 @@ class MinorDynInst : public RefCounted
      *  initiateAcc for memory ops) */
     InstSeqNum instToWaitFor = 0;
 
+    /** Load value prediction metadata (unused unless enableLVP; see
+     *  lvp.hh).  A predicted load's value, and the load-to-load
+     *  address speculation state of a dependent load. */
+    bool lvpPredicted = false;
+    RegVal lvpPredValue = 0;
+    InstSeqNum lvpSpecProducer = 0;
+    int lvpSpecSrcIdx = -1;
+    RegVal lvpSpecSrcVal = 0;
+    bool lvpSpecActive = false;
+    bool lvpSpecIssued = false;
+
     /** Extra delay at the end of the pipeline */
     Cycles extraCommitDelay{0};
     TimingExpr *extraCommitDelayExpr = nullptr;

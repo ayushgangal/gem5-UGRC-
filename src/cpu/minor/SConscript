@@ -55,11 +55,13 @@ if not env['CONF']['USE_NULL_ISA']:
     Source('fetch2.cc')
     Source('func_unit.cc')
     Source('lsq.cc')
+    Source('lvp.cc')
     Source('pipe_data.cc')
     Source('pipeline.cc')
     Source('scoreboard.cc')
     Source('stats.cc')
 
+    DebugFlag('LVP', 'Minor load value prediction')
     DebugFlag('MinorCPU', 'Minor CPU-level events')
     DebugFlag('MinorExecute', 'Minor Execute stage')
     DebugFlag('MinorInterrupt', 'Minor interrupt handling')

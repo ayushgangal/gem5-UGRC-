@@ -434,6 +434,18 @@ class BaseMinorCPU(BaseCPU):
         True, "Enable cycle skipping when the processor is idle\n"
     )
 
+    enableLVP = Param.Bool(
+        False, "Enable load value prediction (research prototype)"
+    )
+    lvpTableEntries = Param.Unsigned(
+        1024, "Number of last-value predictor entries (power of two)"
+    )
+    lvpConfThreshold = Param.Unsigned(
+        3,
+        "Confidence (1-3, 2-bit saturating counter) needed to make a"
+        " prediction",
+    )
+
     branchPred = Param.BranchPredictor(
         TournamentBP(numThreads=Parent.numThreads), "Branch Predictor"
     )

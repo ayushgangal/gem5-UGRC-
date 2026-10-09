@@ -45,6 +45,7 @@
 #ifndef __CPU_MINOR_EXECUTE_HH__
 #define __CPU_MINOR_EXECUTE_HH__
 
+#include <memory>
 #include <vector>
 
 #include "base/named.hh"
@@ -53,6 +54,7 @@
 #include "cpu/minor/cpu.hh"
 #include "cpu/minor/func_unit.hh"
 #include "cpu/minor/lsq.hh"
+#include "cpu/minor/lvp.hh"
 #include "cpu/minor/pipe_data.hh"
 #include "cpu/minor/scoreboard.hh"
 
@@ -113,6 +115,11 @@ class Execute : public Named
     /** Allow mem refs to leave their FUs before reaching the head
      *  of the in flight insts queue if their dependencies are met */
     bool allowEarlyMemIssue;
+
+    /** Load value prediction enabled.  The predictor only exists (and
+     *  its stats are only registered) when this is true. */
+    bool enableLVP;
+    std::unique_ptr<LastValuePredictor> lvp;
 
     /** The FU index of the non-existent costless FU for instructions
      *  which pass the MinorDynInst::isNoCostInst test */
