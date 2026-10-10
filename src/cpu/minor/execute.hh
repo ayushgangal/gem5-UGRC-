@@ -119,6 +119,10 @@ class Execute : public Named
     /** Load value prediction enabled.  The predictor only exists (and
      *  its stats are only registered) when this is true. */
     bool enableLVP;
+    /** Let dependent loads use a confident prediction to compute their
+     *  address early.  Validated at construction to imply enableLVP and
+     *  allowEarlyMemIssue.  Not used until address speculation exists. */
+    bool lvpSpecAddr;
     std::unique_ptr<LastValuePredictor> lvp;
 
     /** The FU index of the non-existent costless FU for instructions
@@ -265,6 +269,31 @@ class Execute : public Named
 
     /** Are we between instructions?  Can we be interrupted? */
     bool isInbetweenInsts(ThreadID thread_id) const;
+
+    /** @name Load value prediction lifecycle (only used if enableLVP)
+     *  @{ */
+    /** Is this an ordinary integer load that can be predicted? */
+    bool lvpEligibleProducer(const MinorDynInstPtr &inst) const;
+
+    /** Called once for each instruction issued into an FU: look up and
+     *  attach a confident prediction to an eligible load */
+    void lvpOnIssue(MinorDynInstPtr inst);
+
+    /** Called when an eligible load's response has been completed (so the
+     *  loaded value is in the register file): train the table and record
+     *  whether a prediction was right.  Counting is left to lvpClassify */
+    void lvpValidateProducer(MinorDynInstPtr inst, ThreadContext *thread);
+
+    /** Classify the terminal outcome of the instruction that is about to be
+     *  removed from the in-flight queue, independently for the producer and
+     *  speculative consumer roles.  The flags are the commit loop's own
+     *  flags for this iteration's instruction */
+    void lvpClassify(MinorDynInstPtr inst, bool discarded, bool faulted,
+        bool committed);
+
+    /** Live predictions can't exceed what is in the in-flight queues */
+    void lvpCheckOccupancy() const;
+    /** @} */
 
     /** Act on an interrupt.  Returns true if an interrupt was actually
      *  signalled and invoked */

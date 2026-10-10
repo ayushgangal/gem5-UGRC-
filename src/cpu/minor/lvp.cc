@@ -43,7 +43,7 @@ LastValuePredictor::LastValuePredictor(statistics::Group *parent,
     table(entries),
     indexMask(entries - 1),
     confThreshold(conf_threshold),
-    stats(this)
+    stats(this, *this)
 {
     fatal_if(entries == 0 || !isPowerOf2(entries),
         "lvpTableEntries must be a non-zero power of two (got %d)", entries);
@@ -52,21 +52,48 @@ LastValuePredictor::LastValuePredictor(statistics::Group *parent,
         conf_threshold);
 }
 
-LastValuePredictor::LVPStats::LVPStats(statistics::Group *parent) :
+LastValuePredictor::LVPStats::LVPStats(statistics::Group *parent,
+    const LastValuePredictor &owner) :
     statistics::Group(parent),
     ADD_STAT(lookups, statistics::units::Count::get(),
              "Eligible load predictor lookups"),
     ADD_STAT(confidentPredictions, statistics::units::Count::get(),
              "Lookups that returned a prediction"),
     ADD_STAT(trainings, statistics::units::Count::get(),
-             "Actual eligible load values used to train the table"),
+             "Eligible loads that completed without fault, not discarded, "
+             "and trained the table (predicted or not)"),
     ADD_STAT(correct, statistics::units::Count::get(),
-             "Predictions made on dynamic loads that validated correct "
-             "(reserved, not yet populated)"),
+             "Confident predictions whose load committed with the "
+             "predicted value"),
     ADD_STAT(incorrect, statistics::units::Count::get(),
-             "Predictions made on dynamic loads that validated incorrect "
-             "(reserved, not yet populated)")
+             "Confident predictions whose load committed with a different "
+             "value"),
+    ADD_STAT(predFaulted, statistics::units::Count::get(),
+             "Confident predictions whose load faulted before validation"),
+    ADD_STAT(predSquashed, statistics::units::Count::get(),
+             "Confident predictions whose load was discarded before "
+             "validation"),
+    ADD_STAT(predInFlight, statistics::units::Count::get(),
+             "Confident predictions without a terminal outcome yet"),
+    ADD_STAT(predCarryIn, statistics::units::Count::get(),
+             "predInFlight at the most recent statistics reset"),
+    ADD_STAT(specLoadsIssued, statistics::units::Count::get(),
+             "Speculative dependent loads accepted by the LSQ"),
+    ADD_STAT(specLoadsCommitted, statistics::units::Count::get(),
+             "Speculative dependent loads that committed"),
+    ADD_STAT(specLoadsFaulted, statistics::units::Count::get(),
+             "Speculative dependent loads that committed with a fault"),
+    ADD_STAT(specLoadsSquashed, statistics::units::Count::get(),
+             "Speculative dependent loads that were discarded"),
+    ADD_STAT(specInFlight, statistics::units::Count::get(),
+             "Speculative dependent loads without a terminal outcome yet"),
+    ADD_STAT(specCarryIn, statistics::units::Count::get(),
+             "specInFlight at the most recent statistics reset")
 {
+    predInFlight.functor([&owner]() { return owner.livePredictions(); });
+    predCarryIn.functor([&owner]() { return owner.predCarryInAtReset(); });
+    specInFlight.functor([&owner]() { return owner.liveSpecLoads(); });
+    specCarryIn.functor([&owner]() { return owner.specCarryInAtReset(); });
 }
 
 bool
@@ -81,6 +108,84 @@ LastValuePredictor::lookup(Addr pc, RegVal &val)
         return true;
     }
     return false;
+}
+
+void
+LastValuePredictor::predictionIssued()
+{
+    ++livePred;
+}
+
+void
+LastValuePredictor::producerValidated(bool correct)
+{
+    panic_if(livePred == 0, "LVP: prediction outcome without live prediction");
+    --livePred;
+    if (correct)
+        ++stats.correct;
+    else
+        ++stats.incorrect;
+}
+
+void
+LastValuePredictor::producerFaulted()
+{
+    panic_if(livePred == 0, "LVP: prediction fault without live prediction");
+    --livePred;
+    ++stats.predFaulted;
+}
+
+void
+LastValuePredictor::producerSquashed()
+{
+    panic_if(livePred == 0, "LVP: prediction squash without live prediction");
+    --livePred;
+    ++stats.predSquashed;
+}
+
+void
+LastValuePredictor::consumerAccepted()
+{
+    ++liveSpec;
+    ++stats.specLoadsIssued;
+}
+
+void
+LastValuePredictor::consumerCommitted()
+{
+    panic_if(liveSpec == 0, "LVP: speculative load commit without live load");
+    --liveSpec;
+    ++stats.specLoadsCommitted;
+}
+
+void
+LastValuePredictor::consumerFaulted()
+{
+    panic_if(liveSpec == 0, "LVP: speculative load fault without live load");
+    --liveSpec;
+    ++stats.specLoadsFaulted;
+}
+
+void
+LastValuePredictor::consumerSquashed()
+{
+    panic_if(liveSpec == 0, "LVP: speculative load squash without live load");
+    --liveSpec;
+    ++stats.specLoadsSquashed;
+}
+
+void
+LastValuePredictor::resetStats()
+{
+    /* The live counts are not statistics and survive the reset.  Remember
+     * them so that outcomes counted after the reset for work that started
+     * before it can be accounted for:
+     *   confidentPredictions + predCarryIn ==
+     *       correct + incorrect + predFaulted + predSquashed + predInFlight
+     * (and the same for speculative loads). */
+    carryPred = livePred;
+    carrySpec = liveSpec;
+    statistics::Group::resetStats();
 }
 
 void

@@ -73,7 +73,47 @@ class LastValuePredictor : public statistics::Group
     /** Train the table with the actual value of an eligible load at pc. */
     void train(Addr pc, RegVal actual);
 
+    /** @name Prediction (producer) lifecycle
+     *  A confident prediction is attached to an instruction at issue and
+     *  must reach exactly one terminal outcome: validated (correct or
+     *  incorrect), faulted or squashed.  Each terminal call requires a
+     *  live prediction and panics otherwise.
+     *  @{ */
+    void predictionIssued();
+    void producerValidated(bool correct);
+    void producerFaulted();
+    void producerSquashed();
+    /** @} */
+
+    /** @name Speculative dependent load (consumer) lifecycle
+     *  A load whose request was accepted by the LSQ using a predicted source
+     *  value must reach exactly one terminal outcome.
+     *  @{ */
+    void consumerAccepted();
+    void consumerCommitted();
+    void consumerFaulted();
+    void consumerSquashed();
+    /** @} */
+
+    /** Predictions / speculative loads that have not yet reached a terminal
+     *  outcome.  Plain integers, not statistics, so that statistics resets
+     *  do not change them */
+    uint64_t livePredictions() const { return livePred; }
+    uint64_t liveSpecLoads() const { return liveSpec; }
+
+    /** Live counts recorded by the most recent statistics reset */
+    uint64_t predCarryInAtReset() const { return carryPred; }
+    uint64_t specCarryInAtReset() const { return carrySpec; }
+
+    /** Record the live counts, then reset the statistics */
+    void resetStats() override;
+
   private:
+    uint64_t livePred = 0;
+    uint64_t liveSpec = 0;
+    uint64_t carryPred = 0;
+    uint64_t carrySpec = 0;
+
     struct Entry
     {
         bool valid = false;
@@ -92,18 +132,35 @@ class LastValuePredictor : public statistics::Group
   public:
     struct LVPStats : public statistics::Group
     {
-        LVPStats(statistics::Group *parent);
+        LVPStats(statistics::Group *parent, const LastValuePredictor &owner);
 
-        /** Eligible predictor lookups */
+        /** Eligible predictor lookups (at issue, so includes loads that
+         *  are later squashed) */
         statistics::Scalar lookups;
         /** Lookups that returned a prediction */
         statistics::Scalar confidentPredictions;
-        /** Actual eligible load values used to train the table */
+        /** Eligible loads that completed (not discarded, no fault) and
+         *  trained the table, whether or not they were predicted */
         statistics::Scalar trainings;
-        /** Reserved: validated predictions that were used and right */
+
+        /** Terminal outcomes of confident predictions */
         statistics::Scalar correct;
-        /** Reserved: validated predictions that were used and wrong */
         statistics::Scalar incorrect;
+        statistics::Scalar predFaulted;
+        statistics::Scalar predSquashed;
+        /** Confident predictions without a terminal outcome yet */
+        statistics::Value predInFlight;
+        /** Value of predInFlight at the most recent statistics reset */
+        statistics::Value predCarryIn;
+
+        /** Speculative dependent loads accepted by the LSQ, and their
+         *  terminal outcomes */
+        statistics::Scalar specLoadsIssued;
+        statistics::Scalar specLoadsCommitted;
+        statistics::Scalar specLoadsFaulted;
+        statistics::Scalar specLoadsSquashed;
+        statistics::Value specInFlight;
+        statistics::Value specCarryIn;
     } stats;
 };
 

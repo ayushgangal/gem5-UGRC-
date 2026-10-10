@@ -48,6 +48,7 @@
 #include "debug/Branch.hh"
 #include "debug/Drain.hh"
 #include "debug/ExecFaulting.hh"
+#include "debug/LVP.hh"
 #include "debug/MinorExecute.hh"
 #include "debug/MinorInterrupt.hh"
 #include "debug/MinorMem.hh"
@@ -80,6 +81,7 @@ Execute::Execute(const std::string &name_,
     setTraceTimeOnIssue(params.executeSetTraceTimeOnIssue),
     allowEarlyMemIssue(params.executeAllowEarlyMemoryIssue),
     enableLVP(params.enableLVP),
+    lvpSpecAddr(params.lvpSpecAddr),
     noCostFUIndex(fuDescriptions.funcUnits.size() + 1),
     lsq(name_ + ".lsq", name_ + ".dcache_port",
         cpu_, *this,
@@ -95,6 +97,15 @@ Execute::Execute(const std::string &name_,
     issuePriority(0),
     commitPriority(0)
 {
+    if (lvpSpecAddr && !enableLVP) {
+        fatal("%s: lvpSpecAddr requires enableLVP\n", name_);
+    }
+
+    if (lvpSpecAddr && !allowEarlyMemIssue) {
+        fatal("%s: lvpSpecAddr requires executeAllowEarlyMemoryIssue\n",
+            name_);
+    }
+
     if (enableLVP) {
         lvp = std::make_unique<LastValuePredictor>(&cpu_,
             params.lvpTableEntries, params.lvpConfThreshold);
@@ -385,6 +396,18 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
                 static_cast<unsigned int>(packet->getConstPtr<uint8_t>()[0]));
         }
 
+        /* A load that was sent to the LSQ with a predicted source value
+         * must have been given the value the register really holds.  This
+         * has to be checked before completeAcc as the load can overwrite
+         * its own source register. */
+        if (enableLVP && inst->lvpConsState == LVPConsumerState::Accepted) {
+            const RegVal arch_src = thread->getReg(
+                inst->staticInst->srcRegIdx(inst->lvpSpecSrcIdx));
+            panic_if(arch_src != inst->lvpSpecSrcVal,
+                "LVP: speculative load %s used source %#x but the "
+                "register holds %#x", *inst, inst->lvpSpecSrcVal, arch_src);
+        }
+
         /* Complete the memory access instruction */
         fault = inst->staticInst->completeAcc(packet, &context,
             inst->traceData);
@@ -395,6 +418,10 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
                 fault->name());
             fault->invoke(thread, inst->staticInst);
         } else {
+            /* The loaded value is now in the register file */
+            if (enableLVP && is_load && lvpEligibleProducer(inst))
+                lvpValidateProducer(inst, thread);
+
             /* Stores need to be pushed into the store buffer to finish
              *  them off */
             if (response->needsToBeSentToStoreBuffer())
@@ -768,6 +795,9 @@ Execute::issue(ThreadID thread_id)
                         /* Push the instruction onto the inFlight queue so
                          *  it can be committed in order */
                         thread.inFlightInsts->push(fu_inst);
+
+                        if (enableLVP)
+                            lvpOnIssue(inst);
 
                         issued = true;
                     }
@@ -1370,6 +1400,21 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
              *  value from changing too much on the minorview display */
             ex_info.lastPredictionSeqNum = inst->id.predictionSeqNum;
 
+            /* The outcomes belong to inst, so it must be the inst about to
+             *  be removed from the queue */
+            if (enableLVP) {
+                panic_if(inst != ex_info.inFlightInsts->front().inst,
+                    "LVP: completing %s but the head of the in flight "
+                    "queue is %s", *inst,
+                    *(ex_info.inFlightInsts->front().inst));
+
+                /* Use this iteration's flags, not the stream numbers: an
+                 * LVP recovery changes ex_info.streamSeqNum while the
+                 * instruction that caused it is still committing */
+                lvpClassify(inst, discard_inst, fault != NoFault,
+                    committed_inst);
+            }
+
             /* Finished with the inst, remove it from the inst queue and
              *  clear its dependencies */
             ex_info.inFlightInsts->pop();
@@ -1417,6 +1462,128 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
 }
 
 bool
+Execute::lvpEligibleProducer(const MinorDynInstPtr &inst) const
+{
+    if (!inst->isInst())
+        return false;
+
+    const StaticInstPtr &si = inst->staticInst;
+
+    if (!si->isLoad() || si->isAtomic() || si->isStoreConditional() ||
+        si->isMicroop() || si->isSerializing() || si->isDataPrefetch()) {
+        return false;
+    }
+
+    if (si->numDestRegs() != 1)
+        return false;
+
+    /* Integer destinations only.  Index 0 is the zero register on RISC-V,
+     * the only ISA this prototype supports */
+    const RegId &dest = si->destRegIdx(0);
+    return dest.is(IntRegClass) && dest.index() != 0;
+}
+
+void
+Execute::lvpOnIssue(MinorDynInstPtr inst)
+{
+    if (!lvpEligibleProducer(inst))
+        return;
+
+    RegVal predicted = 0;
+    if (lvp->lookup(inst->pc->instAddr(), predicted)) {
+        inst->lvpPredicted = true;
+        inst->lvpPredValue = predicted;
+        inst->lvpProdState = LVPProducerState::Predicted;
+        lvp->predictionIssued();
+
+        DPRINTF(LVP, "Prediction %#x for inst: %s\n", predicted, *inst);
+    }
+}
+
+void
+Execute::lvpValidateProducer(MinorDynInstPtr inst, ThreadContext *thread)
+{
+    const RegVal actual = thread->getReg(inst->staticInst->destRegIdx(0));
+
+    lvp->train(inst->pc->instAddr(), actual);
+
+    if (inst->lvpProdState == LVPProducerState::Predicted) {
+        const bool correct = actual == inst->lvpPredValue;
+        inst->lvpValidation = correct ? LVPValidation::Correct :
+            LVPValidation::Incorrect;
+
+        DPRINTF(LVP, "Validated inst: %s predicted: %#x actual: %#x (%s)\n",
+            *inst, inst->lvpPredValue, actual,
+            correct ? "correct" : "incorrect");
+    }
+}
+
+void
+Execute::lvpClassify(MinorDynInstPtr inst, bool discarded, bool faulted,
+    bool committed)
+{
+    /* An instruction leaves the in-flight queue once, so neither role can
+     * already be classified, and a validation can only have been recorded
+     * for an instruction that carried a prediction. */
+    panic_if(inst->lvpProdState == LVPProducerState::Done,
+        "LVP: producer role classified twice: %s", *inst);
+    panic_if(inst->lvpConsState == LVPConsumerState::Done,
+        "LVP: consumer role classified twice: %s", *inst);
+    panic_if(inst->lvpProdState == LVPProducerState::None &&
+        inst->lvpValidation != LVPValidation::None,
+        "LVP: validation recorded for an inst without a prediction: %s",
+        *inst);
+
+    /* Precedence is discard, then fault, then commit: a discarded response
+     * never reaches handleMemResponse, so a fault it carries is never
+     * taken, and committed is also set for responses that fault. */
+
+    if (inst->lvpProdState == LVPProducerState::Predicted) {
+        if (discarded) {
+            lvp->producerSquashed();
+        } else if (faulted) {
+            lvp->producerFaulted();
+        } else {
+            panic_if(!committed, "LVP: predicted inst neither discarded, "
+                "faulted nor committed: %s", *inst);
+            panic_if(inst->lvpValidation == LVPValidation::None,
+                "LVP: committed predicted inst was never validated: %s",
+                *inst);
+            lvp->producerValidated(
+                inst->lvpValidation == LVPValidation::Correct);
+        }
+        inst->lvpProdState = LVPProducerState::Done;
+    }
+
+    if (inst->lvpConsState == LVPConsumerState::Accepted) {
+        if (discarded) {
+            lvp->consumerSquashed();
+        } else if (faulted) {
+            lvp->consumerFaulted();
+        } else {
+            panic_if(!committed, "LVP: speculative load neither discarded, "
+                "faulted nor committed: %s", *inst);
+            lvp->consumerCommitted();
+        }
+        inst->lvpConsState = LVPConsumerState::Done;
+    }
+}
+
+void
+Execute::lvpCheckOccupancy() const
+{
+    uint64_t occupied = 0;
+    for (ThreadID tid = 0; tid < cpu.numThreads; tid++)
+        occupied += executeInfo[tid].inFlightInsts->occupiedSpace();
+
+    panic_if(lvp->livePredictions() > occupied ||
+        lvp->liveSpecLoads() > occupied,
+        "LVP: %d predictions and %d speculative loads live but only %d "
+        "instructions in flight", lvp->livePredictions(),
+        lvp->liveSpecLoads(), occupied);
+}
+
+bool
 Execute::isInbetweenInsts(ThreadID thread_id) const
 {
     return executeInfo[thread_id].lastCommitWasEndOfMacroop &&
@@ -1432,6 +1599,9 @@ Execute::evaluate()
     BranchData &branch = *out.inputWire;
 
     unsigned int num_issued = 0;
+
+    if (enableLVP)
+        lvpCheckOccupancy();
 
     /* Do all the cycle-wise activities for dcachePort here to potentially
      *  free up input spaces in the LSQ's requests queue */
@@ -1862,6 +2032,12 @@ Execute::isDrained()
             return false;
         }
     }
+
+    /* Everything has left the in-flight queues, and so been classified */
+    panic_if(enableLVP && (lvp->livePredictions() != 0 ||
+        lvp->liveSpecLoads() != 0),
+        "LVP: drained with %d predictions and %d speculative loads live",
+        lvp->livePredictions(), lvp->liveSpecLoads());
 
     return true;
 }

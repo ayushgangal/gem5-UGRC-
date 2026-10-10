@@ -155,6 +155,37 @@ class MinorDynInst;
  *  exec with exec absent if it is 0.  This is used by MinorTrace. */
 std::ostream &operator <<(std::ostream &os, const MinorDynInst &inst);
 
+/** Lifecycle of a confident load value prediction made for a load (the
+ *  "producer" role).  The terminal outcome is classified exactly once, where
+ *  the instruction leaves Execute's in-flight queue, see
+ *  Execute::lvpClassify(). */
+enum class LVPProducerState : uint8_t
+{
+    None,       /* No confident prediction was made for this instruction */
+    Predicted,  /* Prediction made, terminal outcome not yet classified */
+    Done        /* Classified */
+};
+
+/** Result of comparing a prediction with the loaded value.  Recorded when
+ *  the memory response is handled and counted when the instruction leaves
+ *  the in-flight queue. */
+enum class LVPValidation : uint8_t
+{
+    None,
+    Correct,
+    Incorrect
+};
+
+/** Lifecycle of a load whose request was sent to the LSQ using a predicted
+ *  source value (the speculative "consumer" role).  Independent of the
+ *  producer role: an instruction can have both. */
+enum class LVPConsumerState : uint8_t
+{
+    None,
+    Accepted,   /* Request accepted by the LSQ, terminal outcome pending */
+    Done
+};
+
 /** Dynamic instruction for Minor.
  *  MinorDynInst implements the BubbleIF interface
  *  Has two separate notions of sequence number for pre/post-micro-op
@@ -232,7 +263,13 @@ class MinorDynInst : public RefCounted
     int lvpSpecSrcIdx = -1;
     RegVal lvpSpecSrcVal = 0;
     bool lvpSpecActive = false;
-    bool lvpSpecIssued = false;
+
+    /** Producer role: this inst carries a confident prediction */
+    LVPProducerState lvpProdState = LVPProducerState::None;
+    /** Producer role: outcome of validating the prediction */
+    LVPValidation lvpValidation = LVPValidation::None;
+    /** Consumer role: this inst's request used a predicted source value */
+    LVPConsumerState lvpConsState = LVPConsumerState::None;
 
     /** Extra delay at the end of the pipeline */
     Cycles extraCommitDelay{0};

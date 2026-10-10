@@ -437,6 +437,12 @@ class BaseMinorCPU(BaseCPU):
     enableLVP = Param.Bool(
         False, "Enable load value prediction (research prototype)"
     )
+    lvpSpecAddr = Param.Bool(
+        False,
+        "Let a dependent load use a confident load value prediction to"
+        " compute its address early (requires enableLVP and"
+        " executeAllowEarlyMemoryIssue)",
+    )
     lvpTableEntries = Param.Unsigned(
         1024, "Number of last-value predictor entries (power of two)"
     )
