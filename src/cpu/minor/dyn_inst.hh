@@ -262,7 +262,13 @@ class MinorDynInst : public RefCounted
     InstSeqNum lvpSpecProducer = 0;
     int lvpSpecSrcIdx = -1;
     RegVal lvpSpecSrcVal = 0;
+    /** The (unflattened) source register the predicted value stands in for */
+    RegId lvpSpecSrcReg;
+    /** Set (only around the call that sends the request) while this load
+     *  must see lvpSpecSrcVal as its source operand */
     bool lvpSpecActive = false;
+    /** Producer role: a speculative load used this prediction */
+    bool lvpUsedBySpec = false;
 
     /** Producer role: this inst carries a confident prediction */
     LVPProducerState lvpProdState = LVPProducerState::None;

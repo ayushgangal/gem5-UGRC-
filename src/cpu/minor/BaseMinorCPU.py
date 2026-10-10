@@ -443,6 +443,13 @@ class BaseMinorCPU(BaseCPU):
         " compute its address early (requires enableLVP and"
         " executeAllowEarlyMemoryIssue)",
     )
+    lvpSpecPcBegin = Param.Addr(
+        0,
+        "Restrict address speculation to loads, and the predicted loads they"
+        " use, with PCs in [lvpSpecPcBegin, lvpSpecPcEnd).  Both 0 means"
+        " unrestricted.  Requires lvpSpecAddr",
+    )
+    lvpSpecPcEnd = Param.Addr(0, "End (exclusive) of the lvpSpecPcBegin range")
     lvpTableEntries = Param.Unsigned(
         1024, "Number of last-value predictor entries (power of two)"
     )

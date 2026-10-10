@@ -45,6 +45,7 @@
 #ifndef __CPU_MINOR_EXECUTE_HH__
 #define __CPU_MINOR_EXECUTE_HH__
 
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -123,7 +124,25 @@ class Execute : public Named
      *  address early.  Validated at construction to imply enableLVP and
      *  allowEarlyMemIssue.  Not used until address speculation exists. */
     bool lvpSpecAddr;
+    /** Address speculation only uses predictions, and loads, with PCs in
+     *  [lvpSpecPcBegin, lvpSpecPcEnd).  Both 0 means unrestricted */
+    Addr lvpSpecPcBegin;
+    Addr lvpSpecPcEnd;
     std::unique_ptr<LastValuePredictor> lvp;
+
+    /** A confident prediction that a younger load may use as its base
+     *  address, for the thread's most recent writer of a register */
+    struct LVPSpecEntry
+    {
+        /** execSeqNum of the predicted load, as in instToWaitFor */
+        InstSeqNum producerSeq;
+        Addr producerPC;
+        RegVal value;
+    };
+
+    /** Per thread: flattened destination register -> prediction.  Updated
+     *  in issue order (see lvpOnIssue) and cleared on stream changes. */
+    std::vector<std::map<RegId, LVPSpecEntry>> lvpSpecMap;
 
     /** The FU index of the non-existent costless FU for instructions
      *  which pass the MinorDynInst::isNoCostInst test */
@@ -275,9 +294,32 @@ class Execute : public Named
     /** Is this an ordinary integer load that can be predicted? */
     bool lvpEligibleProducer(const MinorDynInstPtr &inst) const;
 
-    /** Called once for each instruction issued into an FU: look up and
-     *  attach a confident prediction to an eligible load */
+    /** Is this an ordinary load of one integer register from one integer
+     *  base register, that can use a predicted base value? */
+    bool lvpEligibleConsumer(const MinorDynInstPtr &inst) const;
+
+    /** Is pc inside the address speculation window? */
+    bool lvpInSpecWindow(Addr pc) const;
+
+    /** Called once for each instruction issued into an FU, in issue order:
+     *  let an eligible load pick up a prediction for its base register,
+     *  forget predictions for registers the instruction writes, then
+     *  look up and attach a confident prediction to an eligible load */
     void lvpOnIssue(MinorDynInstPtr inst);
+
+    /** Forget the predictions for the registers inst writes */
+    void lvpInvalidateDests(const MinorDynInstPtr &inst);
+
+    /** Can fu_inst, at the end of its FU, be sent to the LSQ using a
+     *  predicted base address while head, the oldest instruction in
+     *  flight, is the load that was predicted and is still outstanding in
+     *  the LSQ?  This is only the part of the early memory issue decision
+     *  that is specific to speculation: callers must keep their existing
+     *  checks (LSQ space, bubble, inLSQ, canEarlyIssue, ...) */
+    bool lvpSpecAdmissible(const ExecuteThreadInfo &ex_info,
+        const MinorDynInstPtr &head, bool head_has_response,
+        const MinorDynInstPtr &fu_inst,
+        const MinorDynInstPtr &head_mem_ref_inst) const;
 
     /** Called when an eligible load's response has been completed (so the
      *  loaded value is in the register file): train the table and record

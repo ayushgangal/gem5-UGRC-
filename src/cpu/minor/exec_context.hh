@@ -149,6 +149,16 @@ class ExecContext : public gem5::ExecContext
         const RegId &reg = si->srcRegIdx(idx);
         if (reg.is(InvalidRegClass))
             return 0;
+
+        /* A load that is being sent to the LSQ using a predicted base
+         * address sees the predicted value for exactly that one operand of
+         * exactly that instruction.  Nothing is written to the register
+         * file.  See Execute::lvpSpecAdmissible() */
+        if (inst->lvpSpecActive && idx == inst->lvpSpecSrcIdx &&
+            si == inst->staticInst.get() && reg == inst->lvpSpecSrcReg) {
+            return inst->lvpSpecSrcVal;
+        }
+
         return thread.getReg(reg);
     }
 

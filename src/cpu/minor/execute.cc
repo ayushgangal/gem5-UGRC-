@@ -82,6 +82,8 @@ Execute::Execute(const std::string &name_,
     allowEarlyMemIssue(params.executeAllowEarlyMemoryIssue),
     enableLVP(params.enableLVP),
     lvpSpecAddr(params.lvpSpecAddr),
+    lvpSpecPcBegin(params.lvpSpecPcBegin),
+    lvpSpecPcEnd(params.lvpSpecPcEnd),
     noCostFUIndex(fuDescriptions.funcUnits.size() + 1),
     lsq(name_ + ".lsq", name_ + ".dcache_port",
         cpu_, *this,
@@ -105,6 +107,21 @@ Execute::Execute(const std::string &name_,
         fatal("%s: lvpSpecAddr requires executeAllowEarlyMemoryIssue\n",
             name_);
     }
+
+    const bool spec_window = lvpSpecPcBegin != 0 || lvpSpecPcEnd != 0;
+
+    if (spec_window && !lvpSpecAddr) {
+        fatal("%s: lvpSpecPcBegin and lvpSpecPcEnd require lvpSpecAddr\n",
+            name_);
+    }
+
+    if (spec_window && lvpSpecPcBegin >= lvpSpecPcEnd) {
+        fatal("%s: lvpSpecPcBegin (%#x) must be below lvpSpecPcEnd (%#x)\n",
+            name_, lvpSpecPcBegin, lvpSpecPcEnd);
+    }
+
+    if (lvpSpecAddr)
+        lvpSpecMap.resize(params.numThreads);
 
     if (enableLVP) {
         lvp = std::make_unique<LastValuePredictor>(&cpu_,
@@ -321,8 +338,14 @@ Execute::updateBranchData(
 {
     if (reason != BranchData::NoBranch) {
         /* Bump up the stream sequence number on a real branch*/
-        if (BranchData::isStreamChange(reason))
+        if (BranchData::isStreamChange(reason)) {
             executeInfo[tid].streamSeqNum++;
+
+            /* Nothing issued before the stream change is still live to be
+             * speculated on */
+            if (lvpSpecAddr)
+                lvpSpecMap[tid].clear();
+        }
 
         /* Branches (even mis-predictions) don't change the predictionSeqNum,
          *  just the streamSeqNum */
@@ -357,6 +380,20 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
     /* If true, the trace's predicate value will be taken from the exec
      *  context predicate, otherwise, it will be set to false */
     bool use_context_predicate = true;
+
+    /* A load that was sent to the LSQ with a predicted source value must
+     * have been given the value the register really holds.  Its producer
+     * has committed by now so the register file holds the real value.  This
+     * is checked before any response is acted on (the response could be a
+     * translation fault or an error for a wrong address) and before
+     * completeAcc, as the load can overwrite its own source register. */
+    if (enableLVP && inst->lvpConsState == LVPConsumerState::Accepted) {
+        const RegVal arch_src = thread->getReg(
+            inst->staticInst->srcRegIdx(inst->lvpSpecSrcIdx));
+        panic_if(arch_src != inst->lvpSpecSrcVal,
+            "LVP: speculative load %s used source %#x but the "
+            "register holds %#x", *inst, inst->lvpSpecSrcVal, arch_src);
+    }
 
     if (inst->translationFault != NoFault) {
         /* Invoke memory faults. */
@@ -394,18 +431,6 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
         if (is_load && packet->getSize() > 0) {
             DPRINTF(MinorMem, "Memory data[0]: 0x%x\n",
                 static_cast<unsigned int>(packet->getConstPtr<uint8_t>()[0]));
-        }
-
-        /* A load that was sent to the LSQ with a predicted source value
-         * must have been given the value the register really holds.  This
-         * has to be checked before completeAcc as the load can overwrite
-         * its own source register. */
-        if (enableLVP && inst->lvpConsState == LVPConsumerState::Accepted) {
-            const RegVal arch_src = thread->getReg(
-                inst->staticInst->srcRegIdx(inst->lvpSpecSrcIdx));
-            panic_if(arch_src != inst->lvpSpecSrcVal,
-                "LVP: speculative load %s used source %#x but the "
-                "register holds %#x", *inst, inst->lvpSpecSrcVal, arch_src);
         }
 
         /* Complete the memory access instruction */
@@ -531,6 +556,20 @@ Execute::executeMemRefInst(MinorDynInstPtr inst, BranchData &branch,
             /* Set predicate in tracing */
             if (inst->traceData)
                 inst->traceData->setPredicate(passed_predicate);
+
+            /* initiateAcc has pushed the request: it is in the LSQ, so
+             * from here the speculative load has to reach an outcome.  A
+             * translation fault is suppressed above and taken at the
+             * response, like for any other load. */
+            if (enableLVP && inst->lvpSpecActive && inst->inLSQ &&
+                inst->lvpConsState == LVPConsumerState::None) {
+                inst->lvpConsState = LVPConsumerState::Accepted;
+                lvp->consumerAccepted();
+
+                DPRINTF(LVP, "Speculative load accepted inst: %s "
+                    "producer: %d source: %#x\n", *inst,
+                    inst->lvpSpecProducer, inst->lvpSpecSrcVal);
+            }
 
             /* If the instruction didn't pass its predicate
              * or it is a predicated vector instruction and the
@@ -669,6 +708,9 @@ Execute::issue(ThreadID thread_id)
                      *  it can be committed in order */
                     QueuedInst fu_inst(inst);
                     thread.inFlightInsts->push(fu_inst);
+
+                    if (lvpSpecAddr)
+                        lvpInvalidateDests(inst);
 
                     issued = true;
 
@@ -1062,6 +1104,38 @@ Execute::commitInst(MinorDynInstPtr inst, bool early_memory_issue,
     return completed_inst;
 }
 
+namespace
+{
+
+/** While this exists (and active is true) the load inst sees its predicted
+ *  source value, see ExecContext::getRegOperand().  It is cleared on every
+ *  way out of the scope. */
+class LVPSpecOperandScope
+{
+  private:
+    MinorDynInstPtr inst;
+    const bool active;
+
+  public:
+    LVPSpecOperandScope(const MinorDynInstPtr &inst_, bool active_) :
+        inst(inst_), active(active_)
+    {
+        if (active)
+            inst->lvpSpecActive = true;
+    }
+
+    ~LVPSpecOperandScope()
+    {
+        if (active)
+            inst->lvpSpecActive = false;
+    }
+
+    LVPSpecOperandScope(const LVPSpecOperandScope &) = delete;
+    LVPSpecOperandScope &operator=(const LVPSpecOperandScope &) = delete;
+};
+
+} // anonymous namespace
+
 void
 Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
     BranchData &branch)
@@ -1140,6 +1214,10 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
         bool completed_mem_ref = false;
         bool issued_mem_ref = false;
         bool early_memory_issue = false;
+        /* The early memory issue is of a load using a predicted base
+         * address, and the predicted load that made the prediction */
+        bool lvp_spec_admit = false;
+        MinorDynInstPtr lvp_spec_producer;
 
         /* Must set this again to go around the loop */
         completed_inst = false;
@@ -1212,17 +1290,31 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                 FUPipeline *fu = funcUnits[head_mem_ref_inst->fuIndex];
                 const MinorDynInstPtr &fu_inst = fu->front().inst;
 
+                /* Either all the dependencies are satisfied or, when
+                 *  speculating, the only one is a predicted load that is
+                 *  outstanding at the head of the queue */
+                const bool deps_satisfied =
+                    head_exec_seq_num > fu_inst->instToWaitFor;
+                const bool spec_admit = !deps_satisfied && enableLVP &&
+                    lvpSpecAddr && lvpSpecAdmissible(ex_info, inst,
+                        mem_response != NULL, fu_inst, head_mem_ref_inst);
+
                 /* Use this, possibly out of order, inst as the one
                  *  to 'commit'/send to the LSQ */
                 if (!fu_inst->isBubble() &&
                     !fu_inst->inLSQ &&
                     fu_inst->canEarlyIssue &&
                     ex_info.streamSeqNum == fu_inst->id.streamSeqNum &&
-                    head_exec_seq_num > fu_inst->instToWaitFor)
+                    (deps_satisfied || spec_admit))
                 {
                     DPRINTF(MinorExecute, "Issuing mem ref early"
                         " inst: %s instToWaitFor: %d\n",
                         *(fu_inst), fu_inst->instToWaitFor);
+
+                    if (spec_admit) {
+                        lvp_spec_admit = true;
+                        lvp_spec_producer = inst;
+                    }
 
                     inst = fu_inst;
                     try_to_commit = true;
@@ -1330,9 +1422,22 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                             *inst, inst->minimumCommitCycle - now);
                         completed_inst = false;
                     } else {
-                        completed_inst = commitInst(inst,
-                            early_memory_issue, branch, fault,
-                            committed_inst, issued_mem_ref);
+                        {
+                            LVPSpecOperandScope spec_operand(inst,
+                                lvp_spec_admit);
+
+                            completed_inst = commitInst(inst,
+                                early_memory_issue, branch, fault,
+                                committed_inst, issued_mem_ref);
+                        }
+
+                        /* Only a request that is really in the LSQ makes
+                         * the prediction used */
+                        if (lvp_spec_admit &&
+                            inst->lvpConsState == LVPConsumerState::Accepted)
+                        {
+                            lvp_spec_producer->lvpUsedBySpec = true;
+                        }
                     }
                 } else {
                     /* Discard instruction */
@@ -1461,31 +1566,102 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
     }
 }
 
-bool
-Execute::lvpEligibleProducer(const MinorDynInstPtr &inst) const
+/** An ordinary load of one integer register */
+static bool
+lvpOrdinaryIntLoad(const StaticInstPtr &si)
 {
-    if (!inst->isInst())
-        return false;
-
-    const StaticInstPtr &si = inst->staticInst;
-
     if (!si->isLoad() || si->isAtomic() || si->isStoreConditional() ||
         si->isMicroop() || si->isSerializing() || si->isDataPrefetch()) {
         return false;
     }
 
-    if (si->numDestRegs() != 1)
+    return si->numDestRegs() == 1 && si->destRegIdx(0).is(IntRegClass);
+}
+
+bool
+Execute::lvpEligibleProducer(const MinorDynInstPtr &inst) const
+{
+    if (!inst->isInst() || !lvpOrdinaryIntLoad(inst->staticInst))
         return false;
 
-    /* Integer destinations only.  Index 0 is the zero register on RISC-V,
-     * the only ISA this prototype supports */
-    const RegId &dest = si->destRegIdx(0);
-    return dest.is(IntRegClass) && dest.index() != 0;
+    /* Index 0 is the zero register on RISC-V, the only ISA this prototype
+     * supports */
+    return inst->staticInst->destRegIdx(0).index() != 0;
+}
+
+bool
+Execute::lvpEligibleConsumer(const MinorDynInstPtr &inst) const
+{
+    if (!inst->isInst() || !lvpOrdinaryIntLoad(inst->staticInst))
+        return false;
+
+    /* The base address is the only source */
+    return inst->staticInst->numSrcRegs() == 1 &&
+        inst->staticInst->srcRegIdx(0).is(IntRegClass);
+}
+
+bool
+Execute::lvpInSpecWindow(Addr pc) const
+{
+    if (lvpSpecPcBegin == 0 && lvpSpecPcEnd == 0)
+        return true;
+
+    return pc >= lvpSpecPcBegin && pc < lvpSpecPcEnd;
+}
+
+void
+Execute::lvpInvalidateDests(const MinorDynInstPtr &inst)
+{
+    if (!inst->isInst())
+        return;
+
+    auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
+    auto &spec_map = lvpSpecMap[inst->id.threadId];
+
+    for (unsigned i = 0; i < inst->staticInst->numDestRegs(); i++)
+        spec_map.erase(inst->staticInst->destRegIdx(i).flatten(*isa));
 }
 
 void
 Execute::lvpOnIssue(MinorDynInstPtr inst)
 {
+    if (!inst->isInst())
+        return;
+
+    const StaticInstPtr &si = inst->staticInst;
+    const ThreadID tid = inst->id.threadId;
+
+    /* Instructions are issued in program order, so the map holds the
+     * predictions for the youngest older writer of each register.  The
+     * order of the steps matters for a load like ld a0, 0(a0) */
+
+    /* 1. A load that depends on a predicted load takes the prediction for
+     *    its base register, but only if that predicted load is the writer
+     *    the scoreboard is making it wait for.  Both loads must be in the
+     *    address speculation window. */
+    if (lvpSpecAddr && lvpEligibleConsumer(inst)) {
+        auto &spec_map = lvpSpecMap[tid];
+        auto *isa = cpu.getContext(tid)->getIsaPtr();
+        const RegId &src = si->srcRegIdx(0);
+
+        auto it = spec_map.find(src.flatten(*isa));
+        if (it != spec_map.end() &&
+            it->second.producerSeq == inst->instToWaitFor &&
+            lvpInSpecWindow(inst->pc->instAddr()) &&
+            lvpInSpecWindow(it->second.producerPC)) {
+            inst->lvpSpecProducer = it->second.producerSeq;
+            inst->lvpSpecSrcIdx = 0;
+            inst->lvpSpecSrcVal = it->second.value;
+            inst->lvpSpecSrcReg = src;
+        }
+    }
+
+    /* 2. Whatever was predicted for the registers this instruction writes
+     *    is no longer what they will hold */
+    if (lvpSpecAddr)
+        lvpInvalidateDests(inst);
+
+    /* 3. Look up a prediction for the value an eligible load will load */
     if (!lvpEligibleProducer(inst))
         return;
 
@@ -1496,8 +1672,51 @@ Execute::lvpOnIssue(MinorDynInstPtr inst)
         inst->lvpProdState = LVPProducerState::Predicted;
         lvp->predictionIssued();
 
+        if (lvpSpecAddr) {
+            auto *isa = cpu.getContext(tid)->getIsaPtr();
+            lvpSpecMap[tid][si->destRegIdx(0).flatten(*isa)] =
+                { inst->id.execSeqNum, inst->pc->instAddr(), predicted };
+        }
+
         DPRINTF(LVP, "Prediction %#x for inst: %s\n", predicted, *inst);
     }
+}
+
+bool
+Execute::lvpSpecAdmissible(const ExecuteThreadInfo &ex_info,
+    const MinorDynInstPtr &head, bool head_has_response,
+    const MinorDynInstPtr &fu_inst,
+    const MinorDynInstPtr &head_mem_ref_inst) const
+{
+    if (!enableLVP || !lvpSpecAddr)
+        return false;
+
+    /* The oldest unissued memory op of this thread, which keeps memory
+     * ops in order, and a candidate of the head's thread */
+    if (fu_inst != head_mem_ref_inst ||
+        fu_inst->id.threadId != head->id.threadId) {
+        return false;
+    }
+
+    /* The candidate picked up a prediction at issue, for the writer it is
+     * waiting for.  It has not been sent to the LSQ yet */
+    if (fu_inst->lvpSpecSrcIdx < 0 || fu_inst->lvpSpecProducer == 0 ||
+        fu_inst->instToWaitFor != fu_inst->lvpSpecProducer ||
+        fu_inst->lvpConsState != LVPConsumerState::None) {
+        return false;
+    }
+
+    /* That writer is the oldest instruction in flight, was predicted, and
+     * is outstanding in the LSQ.  Everything older has committed so there
+     * is nothing else the candidate could be waiting for. */
+    if (head->id.execSeqNum != fu_inst->lvpSpecProducer ||
+        head->lvpProdState != LVPProducerState::Predicted ||
+        !head->inLSQ || head_has_response) {
+        return false;
+    }
+
+    return head->id.streamSeqNum == ex_info.streamSeqNum &&
+        fu_inst->id.streamSeqNum == ex_info.streamSeqNum;
 }
 
 void
@@ -1512,9 +1731,18 @@ Execute::lvpValidateProducer(MinorDynInstPtr inst, ThreadContext *thread)
         inst->lvpValidation = correct ? LVPValidation::Correct :
             LVPValidation::Incorrect;
 
-        DPRINTF(LVP, "Validated inst: %s predicted: %#x actual: %#x (%s)\n",
-            *inst, inst->lvpPredValue, actual,
-            correct ? "correct" : "incorrect");
+        DPRINTF(LVP, "Validated inst: %s exec: %d predicted: %#x "
+            "actual: %#x (%s)\n", *inst, inst->id.execSeqNum,
+            inst->lvpPredValue, actual, correct ? "correct" : "incorrect");
+
+        /* There is no recovery yet: a load that used a wrong prediction
+         * cannot be undone.  This is detected here, when the producer's
+         * response is handled, which is before any load that used the
+         * prediction can commit. */
+        panic_if(!correct && inst->lvpUsedBySpec,
+            "LVP: speculative load used a wrong prediction (%#x, actual "
+            "%#x) of %s but recovery is not implemented",
+            inst->lvpPredValue, actual, *inst);
     }
 }
 
@@ -1553,6 +1781,20 @@ Execute::lvpClassify(MinorDynInstPtr inst, bool discarded, bool faulted,
                 inst->lvpValidation == LVPValidation::Correct);
         }
         inst->lvpProdState = LVPProducerState::Done;
+
+        /* The load has an outcome so its prediction can't be used by
+         * anything issued from now on.  A younger writer of the register
+         * may have replaced the entry, in which case it is kept. */
+        if (lvpSpecAddr) {
+            auto &spec_map = lvpSpecMap[inst->id.threadId];
+            auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
+            auto it = spec_map.find(inst->staticInst->destRegIdx(0)
+                .flatten(*isa));
+            if (it != spec_map.end() &&
+                it->second.producerSeq == inst->id.execSeqNum) {
+                spec_map.erase(it);
+            }
+        }
     }
 
     if (inst->lvpConsState == LVPConsumerState::Accepted) {
@@ -1913,6 +2155,22 @@ Execute::getCommittingThread()
 
                 can_commit_insts = can_commit_insts &&
                     (can_transfer_mem_inst || can_execute_fu_inst);
+            } else if (!can_commit_insts && enableLVP && lvpSpecAddr &&
+                !ex_info.inFUMemInsts->empty() && lsq.canRequest()) {
+                /* The head is outstanding in the LSQ, so there is nothing
+                 *  to commit, unless the load behind it can be sent to the
+                 *  LSQ using the head's predicted value */
+                const MinorDynInstPtr head_mem_ref_inst =
+                    ex_info.inFUMemInsts->front().inst;
+                FUPipeline *fu = funcUnits[head_mem_ref_inst->fuIndex];
+                const MinorDynInstPtr &fu_inst = fu->front().inst;
+
+                can_commit_insts = !fu_inst->isBubble() &&
+                    fu_inst->id.threadId == tid &&
+                    !fu_inst->inLSQ &&
+                    fu_inst->canEarlyIssue &&
+                    lvpSpecAdmissible(ex_info, inst, false, fu_inst,
+                        head_mem_ref_inst);
             }
         }
 
