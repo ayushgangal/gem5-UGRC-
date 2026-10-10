@@ -381,6 +381,11 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
      *  context predicate, otherwise, it will be set to false */
     bool use_context_predicate = true;
 
+    /* Set if this load's prediction was used by a speculative load and was
+     * wrong: fetch is redirected to the instruction after this load once
+     * the load has committed (see below) */
+    bool lvp_recover = false;
+
     /* A load that was sent to the LSQ with a predicted source value must
      * have been given the value the register really holds.  Its producer
      * has committed by now so the register file holds the real value.  This
@@ -445,7 +450,7 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
         } else {
             /* The loaded value is now in the register file */
             if (enableLVP && is_load && lvpEligibleProducer(inst))
-                lvpValidateProducer(inst, thread);
+                lvp_recover = lvpValidateProducer(inst, thread);
 
             /* Stores need to be pushed into the store buffer to finish
              *  them off */
@@ -468,6 +473,29 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
 
     /* Generate output to account for branches */
     tryToBranch(inst, fault, branch);
+
+    /* Recover from a wrong prediction that a younger load used.  This is
+     * after tryToBranch so that the thread PC is already the instruction
+     * after this load: this load is committed (it keeps its place in the
+     * lifecycle accounting as an incorrect committed prediction) and
+     * fetch restarts at the first instruction after it.  The stream change
+     * discards everything younger, including the loads that used the
+     * prediction, through the same paths as any other redirect.
+     *
+     * A load is not a control instruction so tryToBranch has not signalled
+     * a stream change for it (a fault would have, but a load whose
+     * response is validated did not fault).  If a stream change is
+     * present anyway it discards the younger instructions itself. */
+    if (lvp_recover && !branch.isStreamChange()) {
+        inst->lvpRedirect = true;
+        lvp->recoveryRedirect();
+
+        DPRINTF(LVP, "Recovery redirect inst: %s exec: %d next PC: %s\n",
+            *inst, inst->id.execSeqNum, thread->pcState());
+
+        updateBranchData(thread_id, BranchData::UnpredictedBranch, inst,
+            thread->pcState(), branch);
+    }
 }
 
 bool
@@ -1719,9 +1747,11 @@ Execute::lvpSpecAdmissible(const ExecuteThreadInfo &ex_info,
         fu_inst->id.streamSeqNum == ex_info.streamSeqNum;
 }
 
-void
+bool
 Execute::lvpValidateProducer(MinorDynInstPtr inst, ThreadContext *thread)
 {
+    bool recover = false;
+
     const RegVal actual = thread->getReg(inst->staticInst->destRegIdx(0));
 
     lvp->train(inst->pc->instAddr(), actual);
@@ -1735,15 +1765,15 @@ Execute::lvpValidateProducer(MinorDynInstPtr inst, ThreadContext *thread)
             "actual: %#x (%s)\n", *inst, inst->id.execSeqNum,
             inst->lvpPredValue, actual, correct ? "correct" : "incorrect");
 
-        /* There is no recovery yet: a load that used a wrong prediction
-         * cannot be undone.  This is detected here, when the producer's
-         * response is handled, which is before any load that used the
-         * prediction can commit. */
-        panic_if(!correct && inst->lvpUsedBySpec,
-            "LVP: speculative load used a wrong prediction (%#x, actual "
-            "%#x) of %s but recovery is not implemented",
-            inst->lvpPredValue, actual, *inst);
+        /* A load that used a wrong prediction is undone by a redirect
+         * (see handleMemResponse).  This is detected here, when the
+         * producer's response is handled, which is before any load that
+         * used the prediction can commit.  A wrong prediction that nobody
+         * used needs no recovery. */
+        recover = !correct && inst->lvpUsedBySpec;
     }
+
+    return recover;
 }
 
 void
@@ -1767,10 +1797,13 @@ Execute::lvpClassify(MinorDynInstPtr inst, bool discarded, bool faulted,
      * taken, and committed is also set for responses that fault. */
 
     if (inst->lvpProdState == LVPProducerState::Predicted) {
+        const char *outcome;
         if (discarded) {
             lvp->producerSquashed();
+            outcome = "squashed";
         } else if (faulted) {
             lvp->producerFaulted();
+            outcome = "faulted";
         } else {
             panic_if(!committed, "LVP: predicted inst neither discarded, "
                 "faulted nor committed: %s", *inst);
@@ -1779,7 +1812,11 @@ Execute::lvpClassify(MinorDynInstPtr inst, bool discarded, bool faulted,
                 *inst);
             lvp->producerValidated(
                 inst->lvpValidation == LVPValidation::Correct);
+            outcome = inst->lvpValidation == LVPValidation::Correct ?
+                "correct" : "incorrect";
         }
+        DPRINTF(LVP, "Prediction outcome inst: %s exec: %d (%s)\n",
+            *inst, inst->id.execSeqNum, outcome);
         inst->lvpProdState = LVPProducerState::Done;
 
         /* The load has an outcome so its prediction can't be used by
@@ -1798,15 +1835,22 @@ Execute::lvpClassify(MinorDynInstPtr inst, bool discarded, bool faulted,
     }
 
     if (inst->lvpConsState == LVPConsumerState::Accepted) {
+        const char *outcome;
         if (discarded) {
             lvp->consumerSquashed();
+            outcome = "squashed";
         } else if (faulted) {
             lvp->consumerFaulted();
+            outcome = "faulted";
         } else {
             panic_if(!committed, "LVP: speculative load neither discarded, "
                 "faulted nor committed: %s", *inst);
             lvp->consumerCommitted();
+            outcome = "committed";
         }
+        DPRINTF(LVP, "Speculative load outcome inst: %s exec: %d "
+            "producer: %d (%s)\n", *inst, inst->id.execSeqNum,
+            inst->lvpSpecProducer, outcome);
         inst->lvpConsState = LVPConsumerState::Done;
     }
 }

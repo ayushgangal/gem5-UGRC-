@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Checks the outputs of run_lvp_stageb.sh.  Usage: check_lvp_stageb.py OUT
+"""Checks the outputs of run_lvp_stageb.sh.
+Usage: check_lvp_stageb.py OUT [stable|phase]
+
+The workload is stable (every slot holds the same pointer, the default) or
+phase (the pointer alternates between two nodes in blocks of 64 slots, so
+confident predictions are wrong at the start of each block and recovery is
+exercised); see ldld.c.
 
 OUT holds, for each run name A, B, C and CL, the directory OUT/<name> that
 gem5 wrote, and OUT/<name>.out and OUT/<name>.rc with its output and exit
 status.  A has LVP disabled, B has prediction only, C has address
-speculation and CL is C again with the LVP debug trace.
+speculation and CL is C again with the LVP debug trace.  The stable
+workload's expectations are in one group of checks and the phase
+workload's in another; only one of them applies to a run.
 
 Nothing is compared until every run has completed: each run must have
 exit status 0 (as recorded by the runner in OUT/<name>.rc), its output,
@@ -31,7 +39,13 @@ import re
 import sys
 
 NUM_SLOTS = 16384
-EXPECTED_CHECKSUM = 7 * NUM_SLOTS
+PHASE_BLOCK = 64
+# stable: every node value is 7.  phase: blocks of 64 slots alternate
+# between nodes holding 7 and 11
+EXPECTED_CHECKSUMS = {
+    "stable": 7 * NUM_SLOTS,
+    "phase": (7 + 11) * (NUM_SLOTS // 2),
+}
 
 # The statistics that the comparisons use
 BASE_STATS = ["simInsts", "system.cpu.numCycles"]
@@ -51,6 +65,7 @@ LVP_STATS = [
     "specLoadsSquashed",
     "specInFlight",
     "specCarryIn",
+    "mispredictSquashes",
 ]
 
 # Instructions that read memory, as the commit trace names them
@@ -253,8 +268,187 @@ def preflight(out, names, lvp_runs):
     return stats, []
 
 
+def phase_checks(
+    out,
+    stats,
+    b,
+    c,
+    cl,
+    matched,
+    accepted,
+    validated,
+    acc_line,
+    val_line,
+    redirects,
+    pred_outcome,
+    cons_outcome,
+):
+    """Expectations from the phase-change program ldld.c (-DLVP_PHASE): the
+    producer's pointer changes at the start of every block of 64 slots, so a
+    confident prediction made from the previous block is wrong there, and a
+    speculative load that used it must be undone.  Events are matched by
+    the instruction's thread and execSeqNum, never only by counts."""
+    section(
+        "Expectations from the phase-change program ldld.c "
+        "(recovery; not universal invariants)"
+    )
+
+    for n, s in (("B", b), ("C", c)):
+        check(
+            s["incorrect"] > 0,
+            "%s: incorrect predictions (%d)" % (n, s["incorrect"]),
+        )
+    check(
+        c["specLoadsCommitted"] > 0,
+        "C: speculative loads committed (%d)" % c["specLoadsCommitted"],
+    )
+    check(
+        c["mispredictSquashes"] > 0,
+        "C: a used wrong prediction triggered a recovery redirect (%d)"
+        % c["mispredictSquashes"],
+    )
+    check(
+        0 < c["mispredictSquashes"] <= c["incorrect"],
+        "C: 0 < recovery redirects (%d) <= incorrect predictions (%d)"
+        % (c["mispredictSquashes"], c["incorrect"]),
+    )
+    check(
+        c["specLoadsSquashed"] >= c["mispredictSquashes"],
+        "C: at least one speculative load squashed for each redirect "
+        "(squashed %d, redirects %d)"
+        % (c["specLoadsSquashed"], c["mispredictSquashes"]),
+    )
+    check(
+        c["specLoadsFaulted"] == 0 and c["specInFlight"] == 0,
+        "C: no speculative load faulted or in flight at the end "
+        "(faulted %d, in flight %d)"
+        % (c["specLoadsFaulted"], c["specInFlight"]),
+    )
+
+    # The log agrees with the statistics of the run that wrote it
+    check(
+        len(redirects) == cl["mispredictSquashes"],
+        "CL: one redirect line per recovery redirect (%d of %d)"
+        % (len(redirects), cl["mispredictSquashes"]),
+    )
+    outcomes = [o for _, o, _ in cons_outcome.values()]
+    for o, stat in (
+        ("committed", "specLoadsCommitted"),
+        ("squashed", "specLoadsSquashed"),
+        ("faulted", "specLoadsFaulted"),
+    ):
+        check(
+            outcomes.count(o) == cl[stat],
+            "CL: speculative load outcomes logged as %s match %s (%d of %d)"
+            % (o, stat, outcomes.count(o), cl[stat]),
+        )
+    check(
+        sorted(k for k in cons_outcome) == sorted(a[1] for a in accepted),
+        "CL: every accepted speculative load has exactly one outcome",
+    )
+    for o in ("correct", "incorrect"):
+        vals = [v for v in pred_outcome.values() if v == o]
+        check(
+            len(vals) == cl[o],
+            "CL: prediction outcomes logged as %s match %s (%d of %d)"
+            % (o, o, len(vals), cl[o]),
+        )
+
+    # Every redirect belongs to a producer that committed with an incorrect
+    # prediction that a speculative load had used, and that load was
+    # accepted before the producer was validated
+    consumers_of = {}
+    for _, cons, prod in accepted:
+        consumers_of.setdefault(prod, []).append(cons)
+
+    bad = []
+    for prod, line in redirects.items():
+        why = []
+        if pred_outcome.get(prod) != "incorrect":
+            why.append("producer outcome %s" % pred_outcome.get(prod))
+        if prod not in val_line or not val_line[prod] < line:
+            why.append("redirect not after the validation")
+        users = consumers_of.get(prod, [])
+        if not users:
+            why.append("no speculative load used the prediction")
+        for cons in users:
+            if not acc_line[cons] < val_line.get(prod, -1):
+                why.append("%s accepted after validation" % (cons,))
+            outcome = cons_outcome.get(cons)
+            if outcome is None or outcome[1] != "squashed":
+                why.append(
+                    "consumer %s not squashed (%s)"
+                    % (cons, outcome and outcome[1])
+                )
+            elif not outcome[0] > line:
+                why.append(
+                    "consumer %s squashed before the redirect" % (cons,)
+                )
+        if why:
+            bad.append((prod, why))
+    check(
+        not bad,
+        "CL: each redirect follows the producer's incorrect validation, "
+        "after its consumer was accepted, and the consumer was squashed "
+        "after it (%d of %d fail)" % (len(bad), len(redirects)),
+    )
+    for prod, why in bad[:5]:
+        report("producer %s: %s" % (prod, "; ".join(why)))
+
+    # And the other way: a wrong prediction that was used is always
+    # recovered from, and nothing that used a wrong prediction committed
+    unrecovered = [
+        prod
+        for prod, users in consumers_of.items()
+        if pred_outcome.get(prod) == "incorrect" and prod not in redirects
+    ]
+    check(
+        not unrecovered,
+        "CL: every used incorrect prediction raised a redirect (%d did not)"
+        % len(unrecovered),
+    )
+    wrong_commits = [
+        cons
+        for cons, (_, outcome, prod) in cons_outcome.items()
+        if outcome == "committed" and pred_outcome.get(prod) != "correct"
+    ]
+    check(
+        not wrong_commits,
+        "CL: every committed speculative load used a correct prediction "
+        "(%d did not)" % len(wrong_commits),
+    )
+    # The program has no other source of squashes of these loads
+    unexplained = [
+        cons
+        for cons, (_, outcome, prod) in cons_outcome.items()
+        if outcome == "squashed" and prod not in redirects
+    ]
+    check(
+        not unexplained,
+        "CL: every squashed speculative load was squashed by its "
+        "producer's redirect (%d were not)" % len(unexplained),
+    )
+    report(
+        "recovery redirects: %d of %d block boundaries; speculative loads: "
+        "%d committed, %d squashed"
+        % (
+            len(redirects),
+            NUM_SLOTS // PHASE_BLOCK - 1,
+            c["specLoadsCommitted"],
+            c["specLoadsSquashed"],
+        )
+    )
+
+
 def main():
+    if len(sys.argv) not in (2, 3) or (
+        len(sys.argv) == 3 and sys.argv[2] not in EXPECTED_CHECKSUMS
+    ):
+        print(__doc__)
+        return 2
     out = sys.argv[1]
+    workload = sys.argv[2] if len(sys.argv) == 3 else "stable"
+    expected_checksum = EXPECTED_CHECKSUMS[workload]
     names = ["A", "B", "C", "CL"]
 
     section("Preflight: every run completed and wrote its outputs")
@@ -272,8 +466,8 @@ def main():
 
     for n in names:
         check(
-            checksum(out, n) == EXPECTED_CHECKSUM,
-            "%s: checksum is %d" % (n, EXPECTED_CHECKSUM),
+            checksum(out, n) == expected_checksum,
+            "%s: checksum is %d" % (n, expected_checksum),
         )
 
     # Prediction-only must not change anything but the LVP statistics
@@ -305,6 +499,7 @@ def main():
     section("Lifecycle invariants (any program)")
 
     check(b["specLoadsIssued"] == 0, "B: no speculative loads")
+    check(b["mispredictSquashes"] == 0, "B: no recovery redirects")
 
     for n, s in (("B", b), ("C", c)):
         check(
@@ -338,6 +533,11 @@ def main():
             s["lookups"] >= s["trainings"] >= s["correct"] + s["incorrect"],
             "%s: lookups >= trainings >= validated" % n,
         )
+        check(
+            s["mispredictSquashes"] <= s["incorrect"],
+            "%s: recovery redirects (%d) <= incorrect predictions (%d)"
+            % (n, s["mispredictSquashes"], s["incorrect"]),
+        )
 
     check(b["trainings"] == c["trainings"], "B and C: same trainings")
 
@@ -354,18 +554,41 @@ def main():
     val_re = re.compile(
         r"^\s*(\d+):.*Validated inst: " + inst_id + r" .*exec: (\d+) predicted"
     )
+    redir_re = re.compile(
+        r"^\s*(\d+):.*Recovery redirect inst: "
+        + inst_id
+        + r" .*exec: (\d+) next"
+    )
+    pout_re = re.compile(
+        r"^\s*(\d+):.*Prediction outcome inst: "
+        + inst_id
+        + r" .*exec: (\d+) \((\w+)\)"
+    )
+    cout_re = re.compile(
+        r"^\s*(\d+):.*Speculative load outcome inst: "
+        + inst_id
+        + r" .*exec: (\d+) producer: (\d+) \((\w+)\)"
+    )
     accepted = []  # (tick, (thread, exec), (thread, producer exec))
     validated = {}  # (thread, exec) -> tick
+    # Where each event is in the log, which orders events with the same tick
+    acc_line = {}  # consumer (thread, exec) -> line number
+    val_line = {}  # producer -> line number
+    redirects = {}  # producer -> line number
+    pred_outcome = {}  # producer -> "correct", "incorrect", ...
+    cons_outcome = {}  # consumer -> (line number, outcome, producer)
+    duplicate_events = []
     duplicate_validations = []
     id_mismatches = []
     with open(os.path.join(out, "CL", "trace.txt")) as f:
-        for line in f:
+        for lineno, line in enumerate(f):
             m = acc_re.match(line)
             if m:
                 g = m.groups()
                 accepted.append(
                     (int(g[0]), (int(g[1]), int(g[6])), (int(g[1]), int(g[8])))
                 )
+                acc_line[(int(g[1]), int(g[6]))] = lineno
                 continue
             m = val_re.match(line)
             if m:
@@ -377,6 +600,37 @@ def main():
                 if key in validated:
                     duplicate_validations.append(key)
                 validated[key] = int(g[0])
+                val_line[key] = lineno
+                continue
+            m = redir_re.match(line)
+            if m:
+                g = m.groups()
+                key = (int(g[1]), int(g[6]))
+                if int(g[6]) != int(g[8]):
+                    id_mismatches.append(line.strip())
+                if key in redirects:
+                    duplicate_events.append(("redirect", key))
+                redirects[key] = lineno
+                continue
+            m = pout_re.match(line)
+            if m:
+                g = m.groups()
+                key = (int(g[1]), int(g[6]))
+                if int(g[6]) != int(g[8]):
+                    id_mismatches.append(line.strip())
+                if key in pred_outcome:
+                    duplicate_events.append(("prediction outcome", key))
+                pred_outcome[key] = g[9]
+                continue
+            m = cout_re.match(line)
+            if m:
+                g = m.groups()
+                key = (int(g[1]), int(g[6]))
+                if int(g[6]) != int(g[8]):
+                    id_mismatches.append(line.strip())
+                if key in cons_outcome:
+                    duplicate_events.append(("load outcome", key))
+                cons_outcome[key] = (lineno, g[10], (int(g[1]), int(g[9])))
 
     check(
         len(accepted) == lvp(stats["CL"])["specLoadsIssued"],
@@ -387,6 +641,10 @@ def main():
         "CL: no speculative load accepted twice",
     )
     check(not duplicate_validations, "CL: no instruction validated twice")
+    check(
+        not duplicate_events,
+        "CL: no redirect or outcome logged twice (%d)" % len(duplicate_events),
+    )
     check(
         not id_mismatches,
         "CL: a validation's instruction id agrees with its logged exec "
@@ -409,51 +667,75 @@ def main():
         "CL: every producer is older than its speculative load",
     )
 
-    section(
-        "Expectations from the stable-pointer program ldld.c "
-        "(not universal invariants)"
-    )
+    if workload == "stable":
+        section(
+            "Expectations from the stable-pointer program ldld.c "
+            "(not universal invariants)"
+        )
 
-    check(
-        c["specLoadsIssued"] > 0,
-        "C: speculative loads issued (%d)" % c["specLoadsIssued"],
-    )
-    check(
-        c["specLoadsCommitted"] > 0,
-        "C: speculative loads committed (%d)" % c["specLoadsCommitted"],
-    )
-    check(c["correct"] > 0, "C: correct predictions (%d)" % c["correct"])
-    check(
-        c["incorrect"] == 0,
-        "C: no incorrect predictions (all loaded values are constant)",
-    )
-    check(
-        c["specLoadsSquashed"] == 0
-        and c["specLoadsFaulted"] == 0
-        and c["specInFlight"] == 0,
-        "C: no speculative load squashed, faulted or in flight at the end "
-        "(squashed %d, faulted %d, in flight %d)"
-        % (c["specLoadsSquashed"], c["specLoadsFaulted"], c["specInFlight"]),
-    )
-    check(
-        c["specLoadsCommitted"] == c["specLoadsIssued"],
-        "C: every speculative load committed (%d of %d)"
-        % (c["specLoadsCommitted"], c["specLoadsIssued"]),
-    )
-    check(
-        len(matched) > 0,
-        "CL: found producer responses (%d of %d)"
-        % (len(matched), len(accepted)),
-    )
-    check(
-        len(matched) == len(accepted),
-        "CL: every speculative load matches a validation of its "
-        "producer (%d of %d)" % (len(matched), len(accepted)),
-    )
+        check(
+            c["specLoadsIssued"] > 0,
+            "C: speculative loads issued (%d)" % c["specLoadsIssued"],
+        )
+        check(
+            c["specLoadsCommitted"] > 0,
+            "C: speculative loads committed (%d)" % c["specLoadsCommitted"],
+        )
+        check(c["correct"] > 0, "C: correct predictions (%d)" % c["correct"])
+        check(
+            c["incorrect"] == 0,
+            "C: no incorrect predictions (all loaded values are constant)",
+        )
+        check(
+            c["specLoadsSquashed"] == 0
+            and c["specLoadsFaulted"] == 0
+            and c["specInFlight"] == 0,
+            "C: no speculative load squashed, faulted or in flight at the end "
+            "(squashed %d, faulted %d, in flight %d)"
+            % (
+                c["specLoadsSquashed"],
+                c["specLoadsFaulted"],
+                c["specInFlight"],
+            ),
+        )
+        check(
+            c["specLoadsCommitted"] == c["specLoadsIssued"],
+            "C: every speculative load committed (%d of %d)"
+            % (c["specLoadsCommitted"], c["specLoadsIssued"]),
+        )
+        check(
+            len(matched) > 0,
+            "CL: found producer responses (%d of %d)"
+            % (len(matched), len(accepted)),
+        )
+        check(
+            len(matched) == len(accepted),
+            "CL: every speculative load matches a validation of its "
+            "producer (%d of %d)" % (len(matched), len(accepted)),
+        )
+
+    else:
+        phase_checks(
+            out,
+            stats,
+            b,
+            c,
+            lvp(stats["CL"]),
+            matched,
+            accepted,
+            validated,
+            acc_line,
+            val_line,
+            redirects,
+            pred_outcome,
+            cons_outcome,
+        )
+
+    section("Program structure (both workloads)")
 
     # The loads that commit, from A's commit-only execution trace.  The
-    # expectation that no prediction is wrong covers every load in the run,
-    # so these are the loads of sum_slots and nothing else.
+    # assembly check (run_lvp_stageb.sh) has shown that sum_slots() holds
+    # every load in the program, and that it holds exactly two.
     inv = trace_inventory(os.path.join(out, "A", "trace.txt"))
     check(
         inv is not None and inv["instructions"] > 0 and not inv["unparsed"],
@@ -488,6 +770,17 @@ def main():
         report(
             "committed loads by PC: "
             + ", ".join("0x%x x%d" % (pc, n) for pc, n in by_pc)
+        )
+
+    # Branch predictor statistics: reported, never compared.  Recovery
+    # refetches instructions, so the lookups and squashes may differ.
+    section("Branch predictor statistics (reported only)")
+    bp = sorted({k for n in names for k in stats[n] if "branchPred." in k})
+    for k in bp:
+        report(
+            k
+            + ": "
+            + " ".join("%s %s" % (n, stats[n].get(k, "-")) for n in names)
         )
 
     # Performance is reported but never part of the result above

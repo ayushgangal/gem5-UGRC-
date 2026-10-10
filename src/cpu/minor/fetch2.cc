@@ -130,6 +130,24 @@ Fetch2::updateBranchPrediction(const BranchData &branch)
 {
     MinorDynInstPtr inst = branch.inst;
 
+    /* An LVP recovery redirect comes from a load, which is not a control
+     * instruction and so was never predicted, but younger instructions
+     * have been predicted since it was fetched.  Their history, and the
+     * return address stack and indirect predictor state they changed, must
+     * be undone, as for any redirect.  The load has no history of its own
+     * so the squash which takes the history of the branch itself cannot be
+     * used.  The update retires the histories of older branches, which
+     * have all committed, exactly as the other redirects do.  The flag is
+     * cleared so that the history is not handled twice. */
+    if (inst->lvpRedirect &&
+        branch.reason == BranchData::UnpredictedBranch) {
+        DPRINTF(Branch, "LVP recovery redirect inst: %s\n", *inst);
+        inst->lvpRedirect = false;
+        branchPredictor.squash(inst->id.fetchSeqNum, inst->id.threadId);
+        branchPredictor.update(inst->id.fetchSeqNum, inst->id.threadId);
+        return;
+    }
+
     /* Don't even consider instructions we didn't try to predict or faults */
     if (inst->isFault() || !inst->triedToPredict)
         return;

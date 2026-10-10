@@ -323,8 +323,10 @@ class Execute : public Named
 
     /** Called when an eligible load's response has been completed (so the
      *  loaded value is in the register file): train the table and record
-     *  whether a prediction was right.  Counting is left to lvpClassify */
-    void lvpValidateProducer(MinorDynInstPtr inst, ThreadContext *thread);
+     *  whether a prediction was right.  Counting is left to lvpClassify.
+     *  @return true if the prediction was used by a speculative load and
+     *  was wrong, in which case the caller must redirect fetch */
+    bool lvpValidateProducer(MinorDynInstPtr inst, ThreadContext *thread);
 
     /** Classify the terminal outcome of the instruction that is about to be
      *  removed from the in-flight queue, independently for the producer and

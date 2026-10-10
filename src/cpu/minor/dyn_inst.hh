@@ -269,6 +269,10 @@ class MinorDynInst : public RefCounted
     bool lvpSpecActive = false;
     /** Producer role: a speculative load used this prediction */
     bool lvpUsedBySpec = false;
+    /** Producer role: this inst raised an LVP recovery redirect.  Fetch2
+     *  uses it to tell the redirect from other UnpredictedBranch reasons,
+     *  as the inst is not a control instruction and never predicted */
+    bool lvpRedirect = false;
 
     /** Producer role: this inst carries a confident prediction */
     LVPProducerState lvpProdState = LVPProducerState::None;

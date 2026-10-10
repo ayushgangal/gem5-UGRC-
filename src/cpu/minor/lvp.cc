@@ -88,7 +88,11 @@ LastValuePredictor::LVPStats::LVPStats(statistics::Group *parent,
     ADD_STAT(specInFlight, statistics::units::Count::get(),
              "Speculative dependent loads without a terminal outcome yet"),
     ADD_STAT(specCarryIn, statistics::units::Count::get(),
-             "specInFlight at the most recent statistics reset")
+             "specInFlight at the most recent statistics reset"),
+    ADD_STAT(mispredictSquashes, statistics::units::Count::get(),
+             "Recovery redirects raised because a speculative load used a "
+             "prediction that validated incorrect (not every incorrect "
+             "prediction, and not the number of discarded instructions)")
 {
     predInFlight.functor([&owner]() { return owner.livePredictions(); });
     predCarryIn.functor([&owner]() { return owner.predCarryInAtReset(); });
@@ -172,6 +176,12 @@ LastValuePredictor::consumerSquashed()
     panic_if(liveSpec == 0, "LVP: speculative load squash without live load");
     --liveSpec;
     ++stats.specLoadsSquashed;
+}
+
+void
+LastValuePredictor::recoveryRedirect()
+{
+    ++stats.mispredictSquashes;
 }
 
 void

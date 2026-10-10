@@ -13,8 +13,13 @@
  * the producer's data returns.  The generated assembly must be checked
  * (run_lvp_stageb.sh check-asm) before relying on this.
  *
- * This is the stable-pointer case: every slot holds the same pointer.  A
- * phase-change case needs misprediction recovery, so it is not here yet.
+ * By default this is the stable-pointer case: every slot holds the same
+ * pointer.  With -DLVP_PHASE it is the phase-change case: the pointer
+ * alternates between two nodes in blocks of PHASE_BLOCK slots, so the same
+ * producer PC returns a different pointer at the start of every block and
+ * a confident prediction made from the previous block is wrong.  The code
+ * of sum_slots() is the same in both cases, and the slots are filled with
+ * arithmetic only, so there is no load other than the two in sum_slots().
  *
  * The cross toolchain used for gem5 tests has no C library, so this is a
  * freestanding program: it starts at _start and uses Linux system calls
@@ -38,6 +43,10 @@ struct slot
     char pad[56];
 };
 
+#ifdef LVP_PHASE
+#define PHASE_BLOCK 64
+static struct node node_b;
+#endif
 static struct node node;
 static struct slot slots[NUM_SLOTS];
 
@@ -90,9 +99,15 @@ void
 _start(void)
 {
     node.v[3] = 7;
+#ifdef LVP_PHASE
+    node_b.v[3] = 11;
 
     for (long i = 0; i < NUM_SLOTS; i++)
+        slots[i].p = ((i / PHASE_BLOCK) & 1) ? &node_b : &node;
+#else
+    for (long i = 0; i < NUM_SLOTS; i++)
         slots[i].p = &node;
+#endif
 
     print_checksum(sum_slots(slots, NUM_SLOTS));
 

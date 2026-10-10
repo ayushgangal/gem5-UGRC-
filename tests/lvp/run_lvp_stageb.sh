@@ -2,12 +2,28 @@
 #
 # Stage B tests for load-to-load address speculation in MinorCPU.
 #
-#   run_lvp_stageb.sh check-asm   build ldld and check its assembly
-#   run_lvp_stageb.sh run         check-asm, then run A, B, C and CL and
-#                                 check the results
+#   run_lvp_stageb.sh check-asm [WORKLOAD]  build ldld and check its assembly
+#   run_lvp_stageb.sh run [WORKLOAD]        check-asm, then run A, B, C and
+#                                           CL and check the results
+#   run_lvp_stageb.sh run-one WORKLOAD      what run does for one workload
 #
-# OUT (default /tmp/lvp-stage-b) is where everything is written.  gem5 must
-# already be built (build/RISCV/gem5.opt).
+# run starts run-one in a separate process for each workload, so that a
+# failure anywhere in one workload (the build, the assembly check, ...)
+# stops that workload before any simulation, and so that all of them are
+# attempted.  The exit status is nonzero if any workload failed.  The old
+# binary, assembly and results of a workload are removed before it is
+# processed, so that nothing from an earlier run can be mistaken for this
+# one.
+#
+# WORKLOAD is stable (every slot holds the same pointer), phase (the
+# pointer alternates between two nodes in blocks of 64 slots, so used
+# predictions are wrong and recovery is exercised) or all (the default).
+# Each is a separate binary built from ldld.c, with the address speculation
+# window taken from the symbol table of its own binary.
+#
+# OUT (default /tmp/lvp-stage-b) is where everything is written, in a
+# subdirectory for each workload.  gem5 must already be built
+# (build/RISCV/gem5.opt).
 #
 # Every run uses RiscvMinorCPU with caches and enableIdling=False:
 #   A   LVP disabled
@@ -24,9 +40,49 @@ CC=${CC:-riscv64-linux-gnu-gcc}
 OBJDUMP=${OBJDUMP:-riscv64-linux-gnu-objdump}
 NM=${NM:-riscv64-linux-gnu-nm}
 GEM5=${GEM5:-$ROOT/build/RISCV/gem5.opt}
-BIN=$OUT/ldld
+CHECKER=${CHECKER:-$HERE/check_lvp_stageb.py}
 
-mkdir -p "$OUT"
+# Set by select_workload
+WORKLOAD=
+WOUT=
+BIN=
+DEFS=()
+# Set by check_asm, for the workload that was selected last
+WIN_BEGIN=
+WIN_END=
+
+select_workload()
+{
+    case $1 in
+    stable) DEFS=() ;;
+    phase) DEFS=(-DLVP_PHASE) ;;
+    *) echo "unknown workload: $1" >&2; exit 2 ;;
+    esac
+    WORKLOAD=$1
+    WOUT=$OUT/$WORKLOAD
+    BIN=$WOUT/ldld
+    WIN_BEGIN=
+    WIN_END=
+    mkdir -p "$WOUT"
+}
+
+# Remove what an earlier run left for the selected workload: the binary and
+# its disassembly.  Only these names, inside the workload's own directory.
+clean_build()
+{
+    rm -f "${WOUT:?}/ldld" "${WOUT:?}/ldld.S" "${WOUT:?}/sum_slots.S"
+}
+
+# Remove the results of earlier runs of the selected workload, so that the
+# checker can only see what this run wrote
+clean_results()
+{
+    local n
+    for n in A B C CL; do
+        rm -rf "${WOUT:?}/$n"
+        rm -f "${WOUT:?}/$n.out" "${WOUT:?}/$n.rc"
+    done
+}
 
 build()
 {
@@ -40,15 +96,17 @@ build()
     # gp, which a program started by gem5 SE mode has to set up itself (it
     # starts at 0), and this program's _start does not.
     "$CC" -O1 -static -nostdlib -ffreestanding -march=rv64g -mabi=lp64d \
-        -Wl,-n -Wl,--no-relax-gp -Wl,-e,_start -o "$BIN" "$HERE/ldld.c"
+        -Wl,-n -Wl,--no-relax-gp -Wl,-e,_start "${DEFS[@]}" \
+        -o "$BIN" "$HERE/ldld.c"
 }
 
 check_asm()
 {
+    clean_build
     build
-    "$OBJDUMP" -d --no-show-raw-insn "$BIN" > "$OUT/ldld.S"
-    sed -n '/<sum_slots>:/,/^$/p' "$OUT/ldld.S" > "$OUT/sum_slots.S"
-    cat "$OUT/sum_slots.S"
+    "$OBJDUMP" -d --no-show-raw-insn "$BIN" > "$WOUT/ldld.S"
+    sed -n '/<sum_slots>:/,/^$/p' "$WOUT/ldld.S" > "$WOUT/sum_slots.S"
+    cat "$WOUT/sum_slots.S"
 
     # The address range of sum_slots from the symbol table, to be compared
     # with what objdump attributes to the function
@@ -59,7 +117,7 @@ check_asm()
     # The whole disassembly: the dependent load pair, and that there is no
     # other load.  The test expectations in check_lvp_stageb.py rely on
     # what is checked here.
-    python3 -I - "$OUT/ldld.S" sum_slots "0x$addr" "0x$size" <<'PY'
+    python3 -I - "$WOUT/ldld.S" sum_slots "0x$addr" "0x$size" <<'PY'
 import re
 import sys
 
@@ -261,22 +319,39 @@ run_gem5()
     local name=$1 flags=$2
     shift 2
 
-    rm -rf "${OUT:?}/$name"
+    rm -rf "${WOUT:?}/$name"
     local rc=0
-    "$GEM5" -d "$OUT/$name" --debug-flags="$flags" --debug-file=trace.txt \
+    "$GEM5" -d "$WOUT/$name" --debug-flags="$flags" --debug-file=trace.txt \
         "$ROOT/configs/deprecated/example/se.py" \
         --cpu-type=RiscvMinorCPU --caches -c "$BIN" \
         -P 'system.cpu[0].enableIdling=False' "$@" \
-        > "$OUT/$name.out" 2>&1 || rc=$?
-    echo "$rc" > "$OUT/$name.rc"
-    echo "$name: exit status $rc"
+        > "$WOUT/$name.out" 2>&1 || rc=$?
+    echo "$rc" > "$WOUT/$name.rc"
+    echo "$WORKLOAD $name: exit status $rc"
 }
 
-case ${1:-} in
-check-asm)
-    check_asm
-    ;;
-run)
+# The workloads that an argument (default all) names.  Used in an
+# assignment, so that an invalid argument stops the script.
+workloads()
+{
+    case ${1:-all} in
+    all) echo stable phase ;;
+    stable | phase) echo "$1" ;;
+    *) echo "unknown workload: $1" >&2; exit 2 ;;
+    esac
+}
+
+usage()
+{
+    sed -n '3,/^$/{/^$/!p}' "$0" >&2
+    exit 2
+}
+
+run_workload()
+{
+    # Not in a condition: any failure here, in particular of the build and
+    # of the assembly check, ends this process before gem5 is run
+    clean_results
     check_asm
     TRACE=ExecEnable,ExecUser,ExecFaulting,ExecResult,ExecEffAddr,FmtTicksOff
     LVP_ON=(-P 'system.cpu[0].enableLVP=True')
@@ -289,10 +364,46 @@ run)
     run_gem5 C "$TRACE" "${LVP_ON[@]}" "${SPEC[@]}"
     run_gem5 CL LVP "${LVP_ON[@]}" "${SPEC[@]}"
 
-    python3 -I "$HERE/check_lvp_stageb.py" "$OUT"
+    python3 -I "$CHECKER" "$WOUT" "$WORKLOAD"
+}
+
+case ${1:-} in
+check-asm)
+    [ $# -le 2 ] || usage
+    list=$(workloads "${2:-all}")
+    for w in $list; do
+        select_workload "$w"
+        echo "=== $w"
+        check_asm
+    done
+    ;;
+run)
+    [ $# -le 2 ] || usage
+    list=$(workloads "${2:-all}")
+    status=0
+    failed=
+    for w in $list; do
+        echo "=== $w"
+        if ! bash "$0" run-one "$w"; then
+            status=1
+            failed="$failed $w"
+        fi
+    done
+    if [ $status -ne 0 ]; then
+        echo "FAILED workload(s):$failed"
+    fi
+    exit $status
+    ;;
+run-one)
+    [ $# -eq 2 ] || usage
+    case $2 in
+    stable | phase) ;;
+    *) echo "unknown workload: $2" >&2; exit 2 ;;
+    esac
+    select_workload "$2"
+    run_workload
     ;;
 *)
-    sed -n '3,15p' "$0"
-    exit 2
+    usage
     ;;
 esac

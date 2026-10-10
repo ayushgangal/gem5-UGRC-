@@ -95,6 +95,11 @@ class LastValuePredictor : public statistics::Group
     void consumerSquashed();
     /** @} */
 
+    /** Count one recovery redirect: a prediction that was used by a
+     *  speculative load was validated incorrect and a redirect was raised
+     *  to refetch the instructions after the producer */
+    void recoveryRedirect();
+
     /** Predictions / speculative loads that have not yet reached a terminal
      *  outcome.  Plain integers, not statistics, so that statistics resets
      *  do not change them */
@@ -161,6 +166,9 @@ class LastValuePredictor : public statistics::Group
         statistics::Scalar specLoadsSquashed;
         statistics::Value specInFlight;
         statistics::Value specCarryIn;
+
+        /** LVP recovery redirects raised (see recoveryRedirect) */
+        statistics::Scalar mispredictSquashes;
     } stats;
 };
 
