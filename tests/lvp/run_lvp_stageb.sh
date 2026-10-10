@@ -17,7 +17,8 @@
 #
 # WORKLOAD is stable (every slot holds the same pointer), phase (the
 # pointer alternates between two nodes in blocks of 64 slots, so used
-# predictions are wrong and recovery is exercised) or all (the default).
+# predictions are wrong and recovery is exercised), fanout (phase, with two
+# dependent loads from each pointer) or all (the default, all three).
 # Each is a separate binary built from ldld.c, with the address speculation
 # window taken from the symbol table of its own binary.
 #
@@ -47,6 +48,8 @@ WORKLOAD=
 WOUT=
 BIN=
 DEFS=()
+# The number of loads that depend on the producer in sum_slots()
+CONSUMERS=1
 # Set by check_asm, for the workload that was selected last
 WIN_BEGIN=
 WIN_END=
@@ -54,8 +57,9 @@ WIN_END=
 select_workload()
 {
     case $1 in
-    stable) DEFS=() ;;
-    phase) DEFS=(-DLVP_PHASE) ;;
+    stable) DEFS=(); CONSUMERS=1 ;;
+    phase) DEFS=(-DLVP_PHASE); CONSUMERS=1 ;;
+    fanout) DEFS=(-DLVP_PHASE -DLVP_FANOUT); CONSUMERS=2 ;;
     *) echo "unknown workload: $1" >&2; exit 2 ;;
     esac
     WORKLOAD=$1
@@ -66,11 +70,13 @@ select_workload()
     mkdir -p "$WOUT"
 }
 
-# Remove what an earlier run left for the selected workload: the binary and
-# its disassembly.  Only these names, inside the workload's own directory.
+# Remove what an earlier run left for the selected workload: the binary, its
+# disassembly and the load addresses derived from it.  Only these names,
+# inside the workload's own directory.
 clean_build()
 {
-    rm -f "${WOUT:?}/ldld" "${WOUT:?}/ldld.S" "${WOUT:?}/sum_slots.S"
+    rm -f "${WOUT:?}/ldld" "${WOUT:?}/ldld.S" "${WOUT:?}/sum_slots.S" \
+        "${WOUT:?}/load_pcs.txt"
 }
 
 # Remove the results of earlier runs of the selected workload, so that the
@@ -117,7 +123,8 @@ check_asm()
     # The whole disassembly: the dependent load pair, and that there is no
     # other load.  The test expectations in check_lvp_stageb.py rely on
     # what is checked here.
-    python3 -I - "$WOUT/ldld.S" sum_slots "0x$addr" "0x$size" <<'PY'
+    python3 -I - "$WOUT/ldld.S" sum_slots "0x$addr" "0x$size" \
+        "$CONSUMERS" "$WOUT/load_pcs.txt" <<'PY'
 import re
 import sys
 
@@ -187,6 +194,8 @@ for fname, body in blocks:
 unscoped = [i for fname, body in blocks if fname == NO_FUNCTION for i in body]
 name = sys.argv[2]
 sym_addr, sym_size = int(sys.argv[3], 0), int(sys.argv[4], 0)
+n_consumers = int(sys.argv[5])      # loads that depend on the producer
+load_pcs_path = sys.argv[6]         # where the checker finds the load PCs
 
 # Everything that looks like an instruction must have been parsed
 parsed = sum(len(body) for body in funcs.values()) + len(unscoped)
@@ -266,47 +275,80 @@ if sym_size % 4 or insts[0][0] != sym_addr or insts[-1][0] + 4 != end:
                     (name, insts[0][0], insts[-1][0], sym_addr, end,
                      sym_size))
 
-# Producer and consumer: a load whose result is the base register of a
-# later load, with nothing in between that overwrites that register
-pairs = []
+# Producer and consumers: a load whose result is the base register of
+# later loads, with nothing in between that overwrites that register.  The
+# search for consumers stops at the expected number, or when the register is
+# overwritten.
+groups = []
 for i, (addr, mn, ops) in enumerate(insts):
     m = LD_OPS.match(ops) if LOADS.match(mn) else None
     if not m:
         continue
+    consumers = []
     for j in range(i + 1, min(i + 9, len(insts))):
         addr2, mn2, ops2 = insts[j]
         m2 = LD_OPS.match(ops2) if LOADS.match(mn2) else None
         if m2 and m2.group(3) == m.group(1):
-            pairs.append((insts[i], insts[j], insts[i + 1:j]))
-            break
+            consumers.append(insts[j])
+            if len(consumers) == n_consumers or m2.group(1) == m.group(1):
+                break
+            continue
         if ops2.split(",")[0] == m.group(1) and \
                 not CONTROL.match(mn2) and not MEM_OPS.match(mn2):
             break   # the register is overwritten
+    if consumers:
+        last = insts.index(consumers[-1])
+        groups.append((insts[i], consumers, insts[i + 1:last]))
 
 mem_ops = [i for i in insts if MEM_OPS.match(i[1])]
 print("memory operations in %s: %d" % (name, len(mem_ops)))
 
-if len(pairs) != 1:
-    problems.append("expected exactly one dependent load pair in %s, "
-                    "found %d:\n%s" % (name, len(pairs), show(insts)))
-for prod, cons, between in pairs:
-    print("dependent load pair: %x %s %s  ->  %x %s %s" % (prod + cons))
-    # The stable-pointer expectations (no squash) need the consumer to be
-    # on the path of its producer
+if len(groups) != 1:
+    problems.append("expected exactly one producer with dependent loads in "
+                    "%s, found %d:\n%s" % (name, len(groups), show(insts)))
+for prod, consumers, between in groups:
+    for cons in consumers:
+        print("dependent load pair: %x %s %s  ->  %x %s %s" % (prod + cons))
+    if len(consumers) != n_consumers:
+        problems.append("expected %d loads that depend on the producer, "
+                        "found %d:\n%s" %
+                        (n_consumers, len(consumers),
+                         show([prod] + between + consumers)))
+    # The stable-pointer expectations (no squash) need the consumers to be
+    # on the path of their producer
     control = [i for i in between if CONTROL.match(i[1])]
     if control:
         problems.append("branch or jump between the producer and the "
-                        "consumer:\n%s" % show([prod] + between + [cons]))
-if len(mem_ops) != 2:
-    problems.append("expected exactly two memory operations in %s, "
-                    "found %d:\n%s" % (name, len(mem_ops), show(mem_ops)))
+                        "consumers:\n%s" % show([prod] + between + consumers))
+    if n_consumers > 1:
+        # Every consumer must depend on the producer's register itself, so
+        # none may overwrite it, and they must load different things
+        base = LD_OPS.match(prod[2]).group(1)
+        dests = [LD_OPS.match(c[2]).group(1) for c in consumers]
+        offsets = [LD_OPS.match(c[2]).group(2) for c in consumers]
+        if base in dests:
+            problems.append("a consumer overwrites the producer's register "
+                            "%s:\n%s" % (base, show([prod] + consumers)))
+        if len(set(offsets)) != len(offsets):
+            problems.append("consumers load from the same offset:\n%s" %
+                            show([prod] + consumers))
+if len(mem_ops) != 1 + n_consumers:
+    problems.append("expected exactly %d memory operations in %s, "
+                    "found %d:\n%s" %
+                    (1 + n_consumers, name, len(mem_ops), show(mem_ops)))
 
 if problems:
     for p in problems:
         print("FAIL: " + p)
     sys.exit(1)
-print("PASS: producer and consumer found, nothing between them changes "
-      "control flow, and no load outside %s" % name)
+# The checker compares the committed loads with these
+with open(load_pcs_path, "w") as f:
+    for prod, consumers, between in groups:
+        f.write("producer 0x%x\n" % prod[0])
+        for cons in consumers:
+            f.write("consumer 0x%x\n" % cons[0])
+print("PASS: producer and %d consumer(s) found, nothing between them changes "
+      "control flow, and no load outside %s" % (n_consumers, name))
 PY
 
     WIN_BEGIN=$(printf '0x%x' $((0x$addr)))
@@ -335,8 +377,8 @@ run_gem5()
 workloads()
 {
     case ${1:-all} in
-    all) echo stable phase ;;
-    stable | phase) echo "$1" ;;
+    all) echo stable phase fanout ;;
+    stable | phase | fanout) echo "$1" ;;
     *) echo "unknown workload: $1" >&2; exit 2 ;;
     esac
 }
@@ -397,7 +439,7 @@ run)
 run-one)
     [ $# -eq 2 ] || usage
     case $2 in
-    stable | phase) ;;
+    stable | phase | fanout) ;;
     *) echo "unknown workload: $2" >&2; exit 2 ;;
     esac
     select_workload "$2"

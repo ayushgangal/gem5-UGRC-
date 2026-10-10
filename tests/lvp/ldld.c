@@ -21,10 +21,32 @@
  * of sum_slots() is the same in both cases, and the slots are filled with
  * arithmetic only, so there is no load other than the two in sum_slots().
  *
+ * With -DLVP_PHASE -DLVP_FANOUT (fan-out needs the phase-change case) one
+ * producer has two dependent loads at different PCs, from the same base
+ * register and at different offsets:
+ *
+ *      ld   a4, 0(a5)      # producer: the pointer
+ *      ld   a3, 16(a4)     # consumer 1: v[2]
+ *      ld   a2, 24(a4)     # consumer 2: v[3]
+ *
+ * Neither consumer may overwrite the producer's register, so both depend
+ * on the producer itself.  The empty asm statement in sum_slots() is what
+ * guarantees that: the pointer and both loaded values must all be in
+ * registers at the same time, in different ones.  It emits no instruction.
+ * The node values are chosen so that v[2] and v[3] contribute to the
+ * checksum independently: it is the sum of the v[3] values plus the sum
+ * of the v[2] values shifted left by 32.
+ *
  * The cross toolchain used for gem5 tests has no C library, so this is a
  * freestanding program: it starts at _start and uses Linux system calls
  * directly.  That also keeps all the code that runs small and known.
  */
+
+#ifdef LVP_FANOUT
+#ifndef LVP_PHASE
+#error "LVP_FANOUT needs LVP_PHASE"
+#endif
+#endif
 
 #define NUM_SLOTS 16384
 
@@ -72,7 +94,16 @@ sum_slots(struct slot *s, long n)
 
     for (long i = 0; i < n; i++) {
         struct node *p = s[i].p;
+#ifdef LVP_FANOUT
+        long hi = p->v[2];
+        long lo = p->v[3];
+
+        /* p, hi and lo are all live here: no load may write p's register */
+        __asm__ volatile("" : "+r"(hi), "+r"(lo) : "r"(p));
+        sum += lo + (hi << 32);
+#else
         sum += p->v[3];
+#endif
     }
 
     return sum;
@@ -101,6 +132,10 @@ _start(void)
     node.v[3] = 7;
 #ifdef LVP_PHASE
     node_b.v[3] = 11;
+#ifdef LVP_FANOUT
+    node.v[2] = 5;
+    node_b.v[2] = 2;
+#endif
 
     for (long i = 0; i < NUM_SLOTS; i++)
         slots[i].p = ((i / PHASE_BLOCK) & 1) ? &node_b : &node;

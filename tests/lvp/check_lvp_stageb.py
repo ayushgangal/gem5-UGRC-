@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Checks the outputs of run_lvp_stageb.sh.
-Usage: check_lvp_stageb.py OUT [stable|phase]
+Usage: check_lvp_stageb.py OUT [stable|phase|fanout]
 
 The workload is stable (every slot holds the same pointer, the default) or
 phase (the pointer alternates between two nodes in blocks of 64 slots, so
 confident predictions are wrong at the start of each block and recovery is
-exercised); see ldld.c.
+exercised) or fanout (phase, with two dependent loads from each pointer, so
+that one wrong prediction can be used by two speculative loads); see ldld.c.
 
 OUT holds, for each run name A, B, C and CL, the directory OUT/<name> that
 gem5 wrote, and OUT/<name>.out and OUT/<name>.rc with its output and exit
@@ -32,6 +33,7 @@ The checks come in three groups, which are reported separately:
   - performance, which is only reported, and never changes the result.
 """
 
+import collections
 import filecmp
 import math
 import os
@@ -42,10 +44,33 @@ NUM_SLOTS = 16384
 PHASE_BLOCK = 64
 # stable: every node value is 7.  phase: blocks of 64 slots alternate
 # between nodes holding 7 and 11
+# fanout: the phase-change pointers, and each pointer's node has two values
+# that are loaded by two different loads.  The program adds v[3] and
+# v[2] << 32, so the two consumers' contributions are separate fields of
+# the checksum.  The values below are those ldld.c gives the nodes
+# (v[2], v[3]) of node and node_b.
+FANOUT_NODES = ((5, 7), (2, 11))
+
+
+def fanout_sums():
+    """(sum of the v[3] values, sum of the v[2] values) over all the slots,
+    computed from the layout of the slots and the node values, not from any
+    simulation output"""
+    lo = hi = 0
+    for i in range(NUM_SLOTS):
+        v2, v3 = FANOUT_NODES[(i // PHASE_BLOCK) & 1]
+        lo += v3
+        hi += v2
+    return lo, hi
+
+
 EXPECTED_CHECKSUMS = {
     "stable": 7 * NUM_SLOTS,
     "phase": (7 + 11) * (NUM_SLOTS // 2),
+    "fanout": fanout_sums()[0] + (fanout_sums()[1] << 32),
 }
+# The loads in sum_slots() for each slot: the producer and its consumers
+LOADS_PER_SLOT = {"stable": 2, "phase": 2, "fanout": 3}
 
 # The statistics that the comparisons use
 BASE_STATS = ["simInsts", "system.cpu.numCycles"]
@@ -91,6 +116,42 @@ def report(msg):
 def section(title):
     print()
     print("== " + title)
+
+
+def read_load_pcs(out, workload):
+    """The producer's PC and the consumers' PCs, as the assembly check
+    (run_lvp_stageb.sh) wrote them from the binary's disassembly: (producer,
+    [consumers]), or (None, why) if they can't be used"""
+    path = os.path.join(out, "load_pcs.txt")
+    try:
+        with open(path) as f:
+            lines = [line.split() for line in f if line.strip()]
+    except (OSError, UnicodeDecodeError) as e:
+        return None, "cannot read %s: %s" % (path, e)
+    producers, consumers = [], []
+    for fields in lines:
+        if len(fields) != 2 or fields[0] not in ("producer", "consumer"):
+            return None, "unexpected line in %s: %s" % (path, fields)
+        try:
+            pc = int(fields[1], 16)
+        except ValueError:
+            return None, "bad address in %s: %s" % (path, fields)
+        (producers if fields[0] == "producer" else consumers).append(pc)
+    n = LOADS_PER_SLOT[workload]
+    if len(producers) != 1 or len(consumers) != n - 1:
+        return (
+            None,
+            "%s has %d producer(s) and %d consumer(s), expected 1 and %d"
+            % (
+                path,
+                len(producers),
+                len(consumers),
+                n - 1,
+            ),
+        )
+    if len(set(producers + consumers)) != n:
+        return None, "%s has repeated addresses" % path
+    return (producers[0], consumers), "ok"
 
 
 def trace_inventory(path):
@@ -440,6 +501,134 @@ def phase_checks(
     )
 
 
+def fanout_checks(
+    producer_pc,
+    consumer_pcs,
+    c,
+    accepted,
+    acc_line,
+    acc_pc,
+    val_line,
+    val_pc,
+    redirects,
+    cons_outcome,
+):
+    """Expectations from the fan-out program ldld.c (-DLVP_FANOUT): one
+    producer load with two dependent loads at different PCs, both from the
+    producer's register, so both can use one prediction.  The number of
+    consumers that were accepted for each producer is not assumed: it is
+    taken from the log, and the checks are made on what is there."""
+    section("Expectations from the fan-out program ldld.c (two consumers)")
+
+    consumers_of = collections.OrderedDict()
+    for _, cons, prod in accepted:
+        consumers_of.setdefault(prod, []).append(cons)
+
+    check(
+        all(pc in consumer_pcs for pc in acc_pc.values()),
+        "CL: every accepted speculative load is at a consumer PC of the "
+        "assembly check",
+    )
+    check(
+        set(acc_pc.values()) == set(consumer_pcs),
+        "CL: speculative loads were accepted at both consumer PCs "
+        "(%s)" % ", ".join("0x%x" % pc for pc in sorted(set(acc_pc.values()))),
+    )
+    check(
+        all(
+            val_pc[prod] == producer_pc
+            for prod in consumers_of
+            if prod in val_pc
+        ),
+        "CL: every validated producer of a speculative load is at the "
+        "producer PC 0x%x" % producer_pc,
+    )
+    repeated = [
+        prod
+        for prod, cons in consumers_of.items()
+        if len({acc_pc[x] for x in cons}) != len(cons)
+    ]
+    check(
+        not repeated,
+        "CL: no producer has two accepted consumers at the same PC (%d do)"
+        % len(repeated),
+    )
+
+    two = [prod for prod, cons in consumers_of.items() if len(cons) >= 2]
+    check(
+        len(two) >= 1,
+        "CL: at least one producer has two accepted consumers (%d of %d "
+        "producers with an accepted consumer)" % (len(two), len(consumers_of)),
+    )
+    late = [
+        cons
+        for prod, conss in consumers_of.items()
+        if prod in val_line
+        for cons in conss
+        if not acc_line[cons] < val_line[prod]
+    ]
+    check(
+        not late,
+        "CL: every consumer, the second of a producer included, is "
+        "accepted before its producer is validated (%d late)" % len(late),
+    )
+
+    # The recovery of a producer with two consumers
+    two_redirected = [prod for prod in redirects if prod in two]
+    check(
+        len(two_redirected) >= 1,
+        "CL: at least one recovery redirect accounts for two consumers "
+        "(%d of %d redirects)" % (len(two_redirected), len(redirects)),
+    )
+    survivors = [
+        cons
+        for prod in two_redirected
+        for cons in consumers_of[prod]
+        if cons not in cons_outcome or cons_outcome[cons][1] != "squashed"
+    ]
+    check(
+        not survivors,
+        "CL: every consumer of a producer with two consumers that raised a "
+        "redirect was squashed (%d were not)" % len(survivors),
+    )
+
+    # Squashed speculative loads are the consumers of redirected producers,
+    # however many each redirect had
+    of_redirected = sum(len(consumers_of.get(prod, [])) for prod in redirects)
+    check(
+        c["specLoadsSquashed"] == of_redirected,
+        "C: squashed speculative loads are the consumers of the redirected "
+        "producers (%d of %d)" % (c["specLoadsSquashed"], of_redirected),
+    )
+    check(
+        c["specLoadsIssued"]
+        == c["specLoadsCommitted"]
+        + c["specLoadsSquashed"]
+        + c["specLoadsFaulted"],
+        "C: issued speculative loads (%d) = committed (%d) + squashed (%d) "
+        "+ faulted (%d)"
+        % (
+            c["specLoadsIssued"],
+            c["specLoadsCommitted"],
+            c["specLoadsSquashed"],
+            c["specLoadsFaulted"],
+        ),
+    )
+
+    sizes = collections.Counter(len(cons) for cons in consumers_of.values())
+    report(
+        "producers by accepted consumers: "
+        + ", ".join("%d consumer(s) x%d" % kv for kv in sorted(sizes.items()))
+    )
+    sizes = collections.Counter(
+        len(consumers_of.get(prod, [])) for prod in redirects
+    )
+    report(
+        "redirects by consumers accounted for: "
+        + ", ".join("%d consumer(s) x%d" % kv for kv in sorted(sizes.items()))
+    )
+
+
 def main():
     if len(sys.argv) not in (2, 3) or (
         len(sys.argv) == 3 and sys.argv[2] not in EXPECTED_CHECKSUMS
@@ -462,6 +651,14 @@ def main():
         )
         return 1
 
+    pcs, why = read_load_pcs(out, workload)
+    if pcs is None:
+        check(False, "load PCs from the assembly check: " + why)
+        print()
+        print("the load PCs are unusable: nothing was compared")
+        return 1
+    producer_pc, consumer_pcs = pcs
+
     section("Architectural correctness")
 
     for n in names:
@@ -469,6 +666,17 @@ def main():
             checksum(out, n) == expected_checksum,
             "%s: checksum is %d" % (n, expected_checksum),
         )
+    if workload == "fanout":
+        lo_sum, hi_sum = fanout_sums()
+        for n in names:
+            value = checksum(out, n)
+            check(
+                value is not None
+                and value & 0xFFFFFFFF == lo_sum
+                and value >> 32 == hi_sum,
+                "%s: v[3] contributions sum to %d and v[2] contributions "
+                "to %d, independently" % (n, lo_sum, hi_sum),
+            )
 
     # Prediction-only must not change anything but the LVP statistics
     non_lvp = {
@@ -495,6 +703,12 @@ def main():
 
     b = lvp(stats["B"])
     c = lvp(stats["C"])
+
+    # CL is C with a debug trace, which changes nothing the simulation does
+    check(
+        lvp(stats["CL"]) == c,
+        "C and CL: identical cpu.lvp.* statistics",
+    )
 
     section("Lifecycle invariants (any program)")
 
@@ -571,6 +785,8 @@ def main():
     )
     accepted = []  # (tick, (thread, exec), (thread, producer exec))
     validated = {}  # (thread, exec) -> tick
+    acc_pc = {}  # consumer (thread, exec) -> its PC
+    val_pc = {}  # validated producer (thread, exec) -> its PC
     # Where each event is in the log, which orders events with the same tick
     acc_line = {}  # consumer (thread, exec) -> line number
     val_line = {}  # producer -> line number
@@ -589,6 +805,7 @@ def main():
                     (int(g[0]), (int(g[1]), int(g[6])), (int(g[1]), int(g[8])))
                 )
                 acc_line[(int(g[1]), int(g[6]))] = lineno
+                acc_pc[(int(g[1]), int(g[6]))] = int(g[7], 16)
                 continue
             m = val_re.match(line)
             if m:
@@ -601,6 +818,7 @@ def main():
                     duplicate_validations.append(key)
                 validated[key] = int(g[0])
                 val_line[key] = lineno
+                val_pc[key] = int(g[7], 16)
                 continue
             m = redir_re.match(line)
             if m:
@@ -730,12 +948,25 @@ def main():
             pred_outcome,
             cons_outcome,
         )
+        if workload == "fanout":
+            fanout_checks(
+                producer_pc,
+                consumer_pcs,
+                c,
+                accepted,
+                acc_line,
+                acc_pc,
+                val_line,
+                val_pc,
+                redirects,
+                cons_outcome,
+            )
 
-    section("Program structure (both workloads)")
+    section("Program structure (all workloads)")
 
     # The loads that commit, from A's commit-only execution trace.  The
     # assembly check (run_lvp_stageb.sh) has shown that sum_slots() holds
-    # every load in the program, and that it holds exactly two.
+    # every load in the program, and its PCs are in load_pcs.txt.
     inv = trace_inventory(os.path.join(out, "A", "trace.txt"))
     check(
         inv is not None and inv["instructions"] > 0 and not inv["unparsed"],
@@ -755,16 +986,28 @@ def main():
             "A trace: one line for each committed instruction (trace %d, "
             "simInsts %s)" % (inv["instructions"], stats["A"]["simInsts"]),
         )
+        n_loads = LOADS_PER_SLOT[workload]
         total = sum(inv["loads"].values())
         check(
-            total == 2 * NUM_SLOTS,
+            total == n_loads * NUM_SLOTS,
             "A trace: exactly %d committed loads (found %d)"
-            % (2 * NUM_SLOTS, total),
+            % (n_loads * NUM_SLOTS, total),
         )
         check(
-            len(inv["loads"]) == 2,
-            "A trace: exactly two distinct load PCs (found %d)"
-            % len(inv["loads"]),
+            len(inv["loads"]) == n_loads,
+            "A trace: exactly %d distinct load PCs (found %d)"
+            % (n_loads, len(inv["loads"])),
+        )
+        check(
+            inv["loads"]
+            == {pc: NUM_SLOTS for pc in [producer_pc] + consumer_pcs},
+            "A trace: the committed loads are exactly the producer 0x%x "
+            "and the consumer(s) %s of the assembly check, %d times each"
+            % (
+                producer_pc,
+                ", ".join("0x%x" % pc for pc in consumer_pcs),
+                NUM_SLOTS,
+            ),
         )
         by_pc = sorted(inv["loads"].items())[:8]
         report(
@@ -783,6 +1026,18 @@ def main():
             + " ".join("%s %s" % (n, stats[n].get(k, "-")) for n in names)
         )
 
+    if c["mispredictSquashes"]:
+        try:
+            extra = int(
+                float(stats["C"]["system.cpu.branchPred.lookups"])
+            ) - int(float(stats["A"]["system.cpu.branchPred.lookups"]))
+            report(
+                "extra branch predictor lookups in C over A: %d (%.2f per "
+                "recovery redirect)" % (extra, extra / c["mispredictSquashes"])
+            )
+        except (KeyError, ValueError):
+            report("branch predictor lookups are not available")
+
     # Performance is reported but never part of the result above
     section("Performance (reported only, not part of the result)")
 
@@ -793,13 +1048,14 @@ def main():
         "IPC: A %.4f B %.4f C %.4f"
         % tuple(insts / cycles[n] for n in ("A", "B", "C"))
     )
+    n_consumers = LOADS_PER_SLOT[workload] - 1
     report(
-        "C coverage: %d of %d loop iterations used a speculative load "
-        "(%.1f%%)"
+        "C coverage: %d of %d consumer loads committed having been "
+        "speculative (%.1f%%)"
         % (
             c["specLoadsCommitted"],
-            NUM_SLOTS,
-            100.0 * c["specLoadsCommitted"] / NUM_SLOTS,
+            n_consumers * NUM_SLOTS,
+            100.0 * c["specLoadsCommitted"] / (n_consumers * NUM_SLOTS),
         )
     )
     if matched:
