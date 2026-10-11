@@ -59,6 +59,31 @@
  * status 1.  Like the other cases it has no load outside sum_slots(): the
  * addresses it uses are constants, and it only stores to memory.
  *
+ * With -DLVP_CHAIN there are three dependent loads in a row, and the
+ * middle one is both a consumer and a producer:
+ *
+ *      ld   a4, 0(a5)      # L1: the root pointer, from a slot
+ *      ld   a4, 8(a4)      # L2: root->next, a consumer of L1
+ *      ld   a4, 24(a4)     # L3: v[3] of that node, a consumer of L2
+ *
+ * L1's value never changes, so its prediction is always right.  L2's value
+ * is node A's pointer (v[3] = 7) while the loop is trained and node B's
+ * (v[3] = 11) in the last call of each of 32 cycles:
+ *
+ *      root->next = node A;  sum_slots() over 8 slots (trains L2)
+ *      root->next = node B;  store to a large array (empties the cache)
+ *      sum_slots() over 3 slots
+ *
+ * so the first L2 of that call is predicted, with confidence, to be node A.
+ * Speculation is one level deep: L2 can use L1's prediction while L1 is the
+ * oldest instruction, and L3 can use L2's prediction while L2 is, so L3 is
+ * accepted only after L1 has been validated.  For that to happen L2 has to
+ * still be outstanding when L1 commits, which needs L2 to miss in the data
+ * cache.  The slots, the root and both nodes are multiples of 32 KB apart,
+ * so they are in the same set of a 64 KB two-way cache (512 sets of 64
+ * bytes): three lines compete for two ways and each access misses.  The
+ * program has no load outside sum_slots(): its addresses are constants.
+ *
  * The cross toolchain used for gem5 tests has no C library, so this is a
  * freestanding program: it starts at _start and uses Linux system calls
  * directly.  That also keeps all the code that runs small and known.
@@ -73,6 +98,12 @@
 #ifdef LVP_FAULT
 #if defined(LVP_PHASE) || defined(LVP_FANOUT)
 #error "LVP_FAULT is not combined with LVP_PHASE or LVP_FANOUT"
+#endif
+#endif
+
+#ifdef LVP_CHAIN
+#if defined(LVP_PHASE) || defined(LVP_FANOUT) || defined(LVP_FAULT)
+#error "LVP_CHAIN is not combined with the other workloads"
 #endif
 #endif
 
@@ -102,6 +133,21 @@
 #define SWEEP_BYTES (256 * 1024)
 #endif
 
+#ifdef LVP_CHAIN
+#define CHAIN_CYCLES 32
+#define CHAIN_TRAIN 8   /* loads while root->next is node A */
+#define CHAIN_USE 3     /* loads while root->next is node B */
+#define CHAIN_SLOTS (CHAIN_TRAIN + CHAIN_USE)
+
+/* Addresses this far apart are in the same set of the data cache */
+#define CHAIN_STRIDE 32768
+
+/* The root, node A and node B, then the slots, each CHAIN_STRIDE apart */
+#define CHAIN_OBJECTS (3 + CHAIN_SLOTS)
+
+#define SWEEP_BYTES (256 * 1024)
+#endif
+
 struct node
 {
     long v[4];
@@ -121,6 +167,24 @@ struct slot
 static struct node node_b;
 #endif
 #ifdef LVP_FAULT
+static volatile char sweep[SWEEP_BYTES];
+#endif
+#ifdef LVP_CHAIN
+struct root
+{
+    long pad;
+    struct node *next;  /* at offset 8 */
+};
+
+/* A slot is CHAIN_STRIDE long, so that the slots are in the same cache set */
+struct chain_slot
+{
+    struct root *volatile p;
+    char pad[CHAIN_STRIDE - sizeof(struct root *)];
+};
+
+static char arena[CHAIN_OBJECTS * CHAIN_STRIDE]
+    __attribute__((aligned(CHAIN_STRIDE)));
 static volatile char sweep[SWEEP_BYTES];
 #endif
 static struct node node;
@@ -174,6 +238,21 @@ fail(const char *msg, long len)
 #endif
 
 /* Its address range is used to confine address speculation to this loop */
+#ifdef LVP_CHAIN
+__attribute__((noinline)) long
+sum_slots(struct chain_slot *s, long n)
+{
+    long sum = 0;
+
+    for (long i = 0; i < n; i++) {
+        struct root *r = s[i].p;
+        struct node *q = r->next;
+        sum += q->v[3];
+    }
+
+    return sum;
+}
+#else
 __attribute__((noinline)) long
 sum_slots(struct slot *s, long n)
 {
@@ -195,6 +274,7 @@ sum_slots(struct slot *s, long n)
 
     return sum;
 }
+#endif
 
 static void
 print_checksum(long value)
@@ -216,7 +296,33 @@ print_checksum(long value)
 void
 _start(void)
 {
-#ifdef LVP_FAULT
+#ifdef LVP_CHAIN
+    struct root *root = (struct root *)arena;
+    struct node *node_a = (struct node *)(arena + CHAIN_STRIDE);
+    struct node *node_b = (struct node *)(arena + 2 * CHAIN_STRIDE);
+    struct chain_slot *cslots =
+        (struct chain_slot *)(arena + 3 * CHAIN_STRIDE);
+    long total = 0;
+
+    node_a->v[3] = 7;
+    node_b->v[3] = 11;
+    for (long i = 0; i < CHAIN_SLOTS; i++)
+        cslots[i].p = root;
+
+    for (long cycle = 0; cycle < CHAIN_CYCLES; cycle++) {
+        root->next = node_a;
+        total += sum_slots(&cslots[0], CHAIN_TRAIN);
+
+        /* The next first L2 is of node B, and misses in the data cache */
+        root->next = node_b;
+        for (long i = 0; i < SWEEP_BYTES; i += 64)
+            sweep[i] = 1;
+
+        total += sum_slots(&cslots[CHAIN_TRAIN], CHAIN_USE);
+    }
+
+    print_checksum(total);
+#elif defined(LVP_FAULT)
     struct node *a = (struct node *)FAULT_ADDR;
     long total = 0;
 

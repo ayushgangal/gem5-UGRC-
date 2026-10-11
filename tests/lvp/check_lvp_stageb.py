@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Checks the outputs of run_lvp_stageb.sh.
-Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault]
+Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault|chain]
 
 The workload is stable (every slot holds the same pointer, the default) or
 phase (the pointer alternates between two nodes in blocks of 64 slots, so
@@ -9,7 +9,8 @@ exercised) or fanout (phase, with two dependent loads from each pointer, so
 that one wrong prediction can be used by two speculative loads) or fault (a
 wrong prediction that points into a page that has been unmapped, so the
 speculative load that uses it takes a translation fault that must not be
-taken); see ldld.c.
+taken) or chain (three dependent loads, L1, L2 and L3, where L2 is both a
+consumer of L1 and a predicted producer for L3); see ldld.c.
 The phase and fanout runs also check the Fetch2 recovery hook, from the
 Branch debug flag that the runner enables for their CL run.
 
@@ -91,20 +92,48 @@ def fault_checksum():
     return total
 
 
+# chain: CHAIN_CYCLES cycles of: root->next is node A (v[3] = 7) for
+# CHAIN_TRAIN iterations, then node B (v[3] = 11) for CHAIN_USE iterations.
+# The slots, the root and the nodes are CHAIN_STRIDE apart (ldld.c).
+CHAIN_CYCLES = 32
+CHAIN_TRAIN = 8
+CHAIN_USE = 3
+CHAIN_VALUES = (7, 11)  # v[3] of node A and of node B
+CHAIN_STRIDE = 32768
+CHAIN_SLOT_COUNT = CHAIN_TRAIN + CHAIN_USE
+
+
+def chain_checksum():
+    """The program's sum, from the structure of its cycles"""
+    total = 0
+    for _ in range(CHAIN_CYCLES):
+        total += CHAIN_TRAIN * CHAIN_VALUES[0]
+        total += CHAIN_USE * CHAIN_VALUES[1]
+    return total
+
+
 EXPECTED_CHECKSUMS = {
     "stable": 7 * NUM_SLOTS,
     "phase": (7 + 11) * (NUM_SLOTS // 2),
     "fanout": fanout_sums()[0] + (fanout_sums()[1] << 32),
     "fault": fault_checksum(),
+    "chain": chain_checksum(),
 }
 # The loads in sum_slots() for each slot: the producer and its consumers
-LOADS_PER_SLOT = {"stable": 2, "phase": 2, "fanout": 3, "fault": 2}
+LOADS_PER_SLOT = {
+    "stable": 2,
+    "phase": 2,
+    "fanout": 3,
+    "fault": 2,
+    "chain": 3,
+}
 # How many times sum_slots() runs its loop in the whole program
 ITERATIONS = {
     "stable": NUM_SLOTS,
     "phase": NUM_SLOTS,
     "fanout": NUM_SLOTS,
     "fault": FAULT_CYCLES * (FAULT_TRAIN + FAULT_USE),
+    "chain": CHAIN_CYCLES * (CHAIN_TRAIN + CHAIN_USE),
 }
 
 # The statistics that the comparisons use
@@ -163,16 +192,37 @@ def read_load_pcs(out, workload):
             lines = [line.split() for line in f if line.strip()]
     except (OSError, UnicodeDecodeError) as e:
         return None, "cannot read %s: %s" % (path, e)
-    producers, consumers = [], []
+    producers, consumers, chain = [], [], []
     for fields in lines:
-        if len(fields) != 2 or fields[0] not in ("producer", "consumer"):
+        if len(fields) != 2 or fields[0] not in (
+            "producer",
+            "consumer",
+            "chain",
+        ):
             return None, "unexpected line in %s: %s" % (path, fields)
         try:
             pc = int(fields[1], 16)
         except ValueError:
             return None, "bad address in %s: %s" % (path, fields)
-        (producers if fields[0] == "producer" else consumers).append(pc)
+        {"producer": producers, "consumer": consumers, "chain": chain}[
+            fields[0]
+        ].append(pc)
     n = LOADS_PER_SLOT[workload]
+    if workload == "chain":
+        # L1, L2 and L3 in program order
+        if len(chain) != 3 or producers or consumers:
+            return None, (
+                "%s has %d chain line(s), %d other, expected 3 and 0"
+                % (path, len(chain), len(producers) + len(consumers))
+            )
+        if len(set(chain)) != 3 or chain != sorted(chain):
+            return None, "%s: the loads are not 3 distinct, ordered PCs" % path
+        return (chain[0], chain[1:]), "ok"
+    if chain:
+        return None, "%s has chain lines, but %s is not a chain" % (
+            path,
+            workload,
+        )
     if len(producers) != 1 or len(consumers) != n - 1:
         return (
             None,
@@ -1182,6 +1232,231 @@ def fault_trace_checks(inv, consumer_pcs):
     )
 
 
+def chain_checks(
+    l1,
+    l2,
+    l3,
+    c,
+    accepted,
+    acc_line,
+    acc_pc,
+    val_line,
+    val_pc,
+    redirects,
+    pred_outcome,
+    cons_outcome,
+):
+    """Expectations from the chain program ldld.c (-DLVP_CHAIN): L1, L2 and
+    L3 are three dependent loads at the PCs l1, l2 and l3, and L2 is both a
+    consumer of L1 and a producer for L3.  A speculative load can use a
+    prediction only while its producer is the oldest instruction, so L2 can
+    use L1's prediction before L1 is validated, and L3 can use L2's
+    prediction before L2 is, but L3 never uses L1's: the chain is
+    speculative one pair at a time.  Every relationship is taken from the
+    log: an accepted load names its producer by its execSeqNum, and a
+    producer's PC is the PC of its validation (or, for L2, of its own
+    acceptance); a PC that can't be found is not guessed."""
+    section("Expectations from the chain program ldld.c (three loads)")
+
+    producer_of = {cons: prod for _, cons, prod in accepted}
+
+    def pc_of(inst):
+        # a producer's PC: from its validation, else from its acceptance
+        return val_pc.get(inst, acc_pc.get(inst))
+
+    l2s = [k for k, pc in acc_pc.items() if pc == l2]
+    l3s = [k for k, pc in acc_pc.items() if pc == l3]
+    check(
+        all(pc in (l2, l3) for pc in acc_pc.values()),
+        "CL: every accepted speculative load is at L2 (0x%x) or L3 (0x%x)"
+        % (l2, l3),
+    )
+    check(
+        len(l2s) >= 1 and len(l3s) >= 1,
+        "CL: speculative loads were accepted at both L2 (%d) and L3 (%d)"
+        % (len(l2s), len(l3s)),
+    )
+
+    # Which producer each accepted load used
+    bad2 = [k for k in l2s if pc_of(producer_of[k]) != l1]
+    check(
+        not bad2,
+        "CL: every accepted L2 used a producer at L1's PC 0x%x (%d did not, "
+        "or their producer's PC is not in the log)" % (l1, len(bad2)),
+    )
+    bad3 = [k for k in l3s if pc_of(producer_of[k]) != l2]
+    check(
+        not bad3,
+        "CL: every accepted L3 used a producer at L2's PC 0x%x (%d did not, "
+        "or their producer's PC is not in the log)" % (l2, len(bad3)),
+    )
+
+    # One level at a time: when L3 is accepted, L2's own producer (if L2 was
+    # itself accepted) has been validated
+    nested = []
+    for k in l3s:
+        p2 = producer_of[k]
+        if p2 in producer_of:
+            p1 = producer_of[p2]
+            if p1 not in val_line or not val_line[p1] < acc_line[k]:
+                nested.append(k)
+    check(
+        not nested,
+        "CL: no L3 was accepted before the producer of its L2 was validated "
+        "(pairwise speculation, not nested) (%d were)" % len(nested),
+    )
+
+    # Complete chains: accept(L2, producer L1) < validate(L1) <
+    # accept(L3, producer L2) < validate(L2), with the same L2 in both roles
+    chains = [
+        (producer_of[producer_of[k]], producer_of[k], k)
+        for k in l3s
+        if producer_of[k] in producer_of
+        and producer_of[k] in val_line
+        and producer_of[producer_of[k]] in val_line
+        and acc_line[producer_of[k]]
+        < val_line[producer_of[producer_of[k]]]
+        < acc_line[k]
+        < val_line[producer_of[k]]
+    ]
+    check(
+        len(chains) >= 1,
+        "CL: at least one complete chain: accept(L2, producer L1) < "
+        "validate(L1) < accept(L3, producer L2) < validate(L2) (%d of %d "
+        "accepted L3)" % (len(chains), len(l3s)),
+    )
+
+    # L3 used L2's prediction before L2 was validated, whenever L2 was
+    late = [
+        k
+        for k in l3s
+        if producer_of[k] in val_line
+        and not acc_line[k] < val_line[producer_of[k]]
+    ]
+    used = [k for k in l3s if producer_of[k] in val_line]
+    check(
+        len(used) >= 1 and not late,
+        "CL: L3 was accepted before the validation of the L2 whose "
+        "prediction it used (%d of %d, %d late)"
+        % (len(used) - len(late), len(l3s), len(late)),
+    )
+
+    # Recovery from a wrong L2 prediction that L3 used
+    l2_redirects = [p for p in redirects if val_pc.get(p) == l2]
+    used_redirects = [
+        p for p in l2_redirects if any(producer_of[k] == p for k in l3s)
+    ]
+    check(
+        len(used_redirects) >= 1,
+        "CL: at least one incorrect L2 prediction that L3 used triggered a "
+        "recovery redirect (%d of %d redirects of L2)"
+        % (len(used_redirects), len(l2_redirects)),
+    )
+    bad = []
+    for p2 in used_redirects:
+        why = []
+        if pred_outcome.get(p2) != "incorrect":
+            why.append("L2 outcome %s" % pred_outcome.get(p2))
+        for k in l3s:
+            if producer_of[k] != p2:
+                continue
+            outcome = cons_outcome.get(k)
+            if outcome is None or outcome[1] != "squashed":
+                why.append("L3 %s: %s" % (k, outcome and outcome[1]))
+            elif not outcome[0] > redirects[p2]:
+                why.append("L3 %s squashed before the redirect" % (k,))
+        if p2 in producer_of:
+            outcome = cons_outcome.get(p2)
+            if outcome is None or outcome[1] != "committed":
+                why.append("L2 as a consumer: %s" % (outcome and outcome[1]))
+        if why:
+            bad.append((p2, why))
+    check(
+        not bad,
+        "CL: after each such redirect the L3 was squashed after it and the "
+        "L2, a consumer of L1, committed (%d fail)" % len(bad),
+    )
+    for p2, why in bad[:5]:
+        report("L2 %s: %s" % (p2, "; ".join(why)))
+    dual = [
+        p
+        for p in used_redirects
+        if p in producer_of
+        and cons_outcome.get(p, (0, None, None))[1] == "committed"
+    ]
+    check(
+        len(dual) >= 1,
+        "CL: at least one redirected L2 was also an accepted consumer of "
+        "L1 and committed as one (%d of %d)"
+        % (len(dual), len(used_redirects)),
+    )
+
+    other = [p for p in redirects if val_pc.get(p) not in (l1, l2)]
+    check(
+        not other,
+        "CL: every recovery redirect is for an L1 or an L2 (%d are not)"
+        % len(other),
+    )
+    report(
+        "accepted: %d L2, %d L3; complete chains: %d; redirects: %d of L2, "
+        "%d of L1"
+        % (
+            len(l2s),
+            len(l3s),
+            len(chains),
+            len(l2_redirects),
+            len([p for p in redirects if val_pc.get(p) == l1]),
+        )
+    )
+
+
+def chain_trace_checks(inv, producer_pc, consumer_pcs):
+    """What A's committed trace says about the three loads of the chain
+    program: L1 loaded from each of the slots, a constant stride apart, L2
+    from the root every time, and L3 from node A in the training calls and
+    from node B in the last call of each cycle.  The refetched L3 loaded from
+    node B, whatever happened to a speculative L3."""
+    l1, l2, l3 = producer_pc, consumer_pcs[0], consumer_pcs[1]
+    a1 = inv["load_addrs"].get(l1, {})
+    a2 = inv["load_addrs"].get(l2, {})
+    a3 = inv["load_addrs"].get(l3, {})
+    check(
+        len(a1) == CHAIN_SLOT_COUNT
+        and all(n == CHAIN_CYCLES for n in a1.values())
+        and all(a % CHAIN_STRIDE == 0 for a in a1),
+        "A trace: L1 loaded from %d slots, %d times each, at multiples of "
+        "%d (found %d addresses)"
+        % (CHAIN_SLOT_COUNT, CHAIN_CYCLES, CHAIN_STRIDE, len(a1)),
+    )
+    iterations = CHAIN_CYCLES * CHAIN_SLOT_COUNT
+    check(
+        len(a2) == 1
+        and sum(a2.values()) == iterations
+        and all(a % CHAIN_STRIDE == 8 for a in a2),
+        "A trace: L2 loaded %d times from one address, the root's next "
+        "field (found %s)"
+        % (
+            iterations,
+            ", ".join("0x%x x%d" % kv for kv in sorted(a2.items())),
+        ),
+    )
+    check(
+        len(a3) == 2
+        and sorted(a3.values())
+        == sorted([CHAIN_CYCLES * CHAIN_TRAIN, CHAIN_CYCLES * CHAIN_USE])
+        and all(a % CHAIN_STRIDE == 24 for a in a3)
+        and max(a3) - min(a3) == CHAIN_STRIDE,
+        "A trace: L3 loaded %d times from node A and %d times from node B, "
+        "%d bytes apart (found %s)"
+        % (
+            CHAIN_CYCLES * CHAIN_TRAIN,
+            CHAIN_CYCLES * CHAIN_USE,
+            CHAIN_STRIDE,
+            ", ".join("0x%x x%d" % kv for kv in sorted(a3.items())),
+        ),
+    )
+
+
 def main():
     if len(sys.argv) not in (2, 3) or (
         len(sys.argv) == 3 and sys.argv[2] not in EXPECTED_CHECKSUMS
@@ -1511,9 +1786,12 @@ def main():
             redirects,
             pred_outcome,
             cons_outcome,
-            NUM_SLOTS // PHASE_BLOCK - 1
-            if workload != "fault"
-            else FAULT_CYCLES,
+            {
+                "phase": NUM_SLOTS // PHASE_BLOCK - 1,
+                "fanout": NUM_SLOTS // PHASE_BLOCK - 1,
+                "fault": FAULT_CYCLES,
+                "chain": CHAIN_CYCLES,
+            }[workload],
         )
         hook_checks(
             os.path.join(out, "CL", "trace.txt"),
@@ -1543,6 +1821,21 @@ def main():
                 acc_fault,
                 acc_src,
                 val_line,
+                redirects,
+                pred_outcome,
+                cons_outcome,
+            )
+        if workload == "chain":
+            chain_checks(
+                producer_pc,
+                consumer_pcs[0],
+                consumer_pcs[1],
+                c,
+                accepted,
+                acc_line,
+                acc_pc,
+                val_line,
+                val_pc,
                 redirects,
                 pred_outcome,
                 cons_outcome,
@@ -1598,6 +1891,8 @@ def main():
         )
         if workload == "fault":
             fault_trace_checks(inv, consumer_pcs)
+        elif workload == "chain":
+            chain_trace_checks(inv, producer_pc, consumer_pcs)
         by_pc = sorted(inv["loads"].items())[:8]
         report(
             "committed loads by PC: "

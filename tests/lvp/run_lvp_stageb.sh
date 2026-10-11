@@ -20,7 +20,8 @@
 # predictions are wrong and recovery is exercised), fanout (phase, with two
 # dependent loads from each pointer), fault (a wrong prediction that
 # points into a page that has been unmapped, so that the speculative load
-# that uses it takes a translation fault) or all (the default, all four).
+# that uses it takes a translation fault), chain (three dependent loads, the
+# middle one both a consumer and a producer) or all (the default, all five).
 # Each is a separate binary built from ldld.c, with the address speculation
 # window taken from the symbol table of its own binary.
 #
@@ -33,7 +34,7 @@
 #   B   enableLVP, no address speculation (prediction only)
 #   C   enableLVP and address speculation, confined to sum_slots()
 #   CL  C again, logging the LVP events instead of the committed trace.  For
-#       the phase, fanout and fault workloads, which recover from wrong
+#       the phase, fanout, fault and chain workloads, which recover from wrong
 #       predictions,
 #       the branch predictor events (the Branch debug flag) are logged too,
 #       so that the checker can see the Fetch2 recovery hook run.  That adds
@@ -56,8 +57,10 @@ WORKLOAD=
 WOUT=
 BIN=
 DEFS=()
-# The number of loads that depend on the producer in sum_slots()
+# The number of loads that depend on the producer in sum_slots(), and the
+# number of producers that have some (2 in a chain of three loads)
 CONSUMERS=1
+LINKS=1
 # Set by check_asm, for the workload that was selected last
 WIN_BEGIN=
 WIN_END=
@@ -65,10 +68,11 @@ WIN_END=
 select_workload()
 {
     case $1 in
-    stable) DEFS=(); CONSUMERS=1 ;;
-    phase) DEFS=(-DLVP_PHASE); CONSUMERS=1 ;;
-    fanout) DEFS=(-DLVP_PHASE -DLVP_FANOUT); CONSUMERS=2 ;;
-    fault) DEFS=(-DLVP_FAULT); CONSUMERS=1 ;;
+    stable) DEFS=(); CONSUMERS=1; LINKS=1 ;;
+    phase) DEFS=(-DLVP_PHASE); CONSUMERS=1; LINKS=1 ;;
+    fanout) DEFS=(-DLVP_PHASE -DLVP_FANOUT); CONSUMERS=2; LINKS=1 ;;
+    fault) DEFS=(-DLVP_FAULT); CONSUMERS=1; LINKS=1 ;;
+    chain) DEFS=(-DLVP_CHAIN); CONSUMERS=1; LINKS=2 ;;
     *) echo "unknown workload: $1" >&2; exit 2 ;;
     esac
     WORKLOAD=$1
@@ -133,7 +137,7 @@ check_asm()
     # other load.  The test expectations in check_lvp_stageb.py rely on
     # what is checked here.
     python3 -I - "$WOUT/ldld.S" sum_slots "0x$addr" "0x$size" \
-        "$CONSUMERS" "$WOUT/load_pcs.txt" <<'PY'
+        "$CONSUMERS" "$WOUT/load_pcs.txt" "$LINKS" <<'PY'
 import re
 import sys
 
@@ -205,6 +209,7 @@ name = sys.argv[2]
 sym_addr, sym_size = int(sys.argv[3], 0), int(sys.argv[4], 0)
 n_consumers = int(sys.argv[5])      # loads that depend on the producer
 load_pcs_path = sys.argv[6]         # where the checker finds the load PCs
+n_links = int(sys.argv[7])          # producers that have dependent loads
 
 # Everything that looks like an instruction must have been parsed
 parsed = sum(len(body) for body in funcs.values()) + len(unscoped)
@@ -312,9 +317,10 @@ for i, (addr, mn, ops) in enumerate(insts):
 mem_ops = [i for i in insts if MEM_OPS.match(i[1])]
 print("memory operations in %s: %d" % (name, len(mem_ops)))
 
-if len(groups) != 1:
-    problems.append("expected exactly one producer with dependent loads in "
-                    "%s, found %d:\n%s" % (name, len(groups), show(insts)))
+if len(groups) != n_links:
+    problems.append("expected exactly %d producer(s) with dependent loads "
+                    "in %s, found %d:\n%s" %
+                    (n_links, name, len(groups), show(insts)))
 for prod, consumers, between in groups:
     for cons in consumers:
         print("dependent load pair: %x %s %s  ->  %x %s %s" % (prod + cons))
@@ -341,10 +347,32 @@ for prod, consumers, between in groups:
         if len(set(offsets)) != len(offsets):
             problems.append("consumers load from the same offset:\n%s" %
                             show([prod] + consumers))
-if len(mem_ops) != 1 + n_consumers:
+if len(mem_ops) != 1 + n_links * n_consumers:
     problems.append("expected exactly %d memory operations in %s, "
                     "found %d:\n%s" %
-                    (1 + n_consumers, name, len(mem_ops), show(mem_ops)))
+                    (1 + n_links * n_consumers, name, len(mem_ops),
+                     show(mem_ops)))
+
+if n_links == 2 and len(groups) == 2 and \
+        all(len(g[1]) == 1 for g in groups):
+    # A chain of three loads: the consumer of the first producer is the
+    # second producer, so L1 -> L2 -> L3, each at its own PC, with these
+    # offsets and nothing but ld.  The groups were found one register at a
+    # time, so L2's destination is L3's base and L1's is L2's.
+    (l1, (l2,), between1), (l2b, (l3,), between2) = groups
+    if l2 != l2b:
+        problems.append("the consumer of the first load is not the producer "
+                        "of the last:\n%s" % show([l1, l2, l2b, l3]))
+    if len({l1[0], l2[0], l3[0]}) != 3:
+        problems.append("the three loads are not at three distinct PCs:\n%s"
+                        % show([l1, l2, l3]))
+    offsets = [LD_OPS.match(i[2]).group(2) for i in (l1, l2, l3)]
+    if offsets != ["0", "8", "24"] or [l1[1], l2[1], l3[1]] != ["ld"] * 3:
+        problems.append("expected ld with offsets 0, 8 and 24, got:\n%s" %
+                        show([l1, l2, l3]))
+    if l1[0] > l2[0] or l2[0] > l3[0]:
+        problems.append("the loads are not in program order:\n%s" %
+                        show([l1, l2, l3]))
 
 if problems:
     for p in problems:
@@ -352,10 +380,16 @@ if problems:
     sys.exit(1)
 # The checker compares the committed loads with these
 with open(load_pcs_path, "w") as f:
-    for prod, consumers, between in groups:
-        f.write("producer 0x%x\n" % prod[0])
-        for cons in consumers:
-            f.write("consumer 0x%x\n" % cons[0])
+    if n_links == 2:
+        # a chain: the loads in program order, L1, L2 and L3
+        (l1, (l2,), _), (_, (l3,), _) = groups
+        for load in (l1, l2, l3):
+            f.write("chain 0x%x\n" % load[0])
+    else:
+        for prod, consumers, between in groups:
+            f.write("producer 0x%x\n" % prod[0])
+            for cons in consumers:
+                f.write("consumer 0x%x\n" % cons[0])
 print("PASS: producer and %d consumer(s) found, nothing between them changes "
       "control flow, and no load outside %s" % (n_consumers, name))
 PY
@@ -386,8 +420,8 @@ run_gem5()
 workloads()
 {
     case ${1:-all} in
-    all) echo stable phase fanout fault ;;
-    stable | phase | fanout | fault) echo "$1" ;;
+    all) echo stable phase fanout fault chain ;;
+    stable | phase | fanout | fault | chain) echo "$1" ;;
     *) echo "unknown workload: $1" >&2; exit 2 ;;
     esac
 }
@@ -452,7 +486,7 @@ run)
 run-one)
     [ $# -eq 2 ] || usage
     case $2 in
-    stable | phase | fanout | fault) ;;
+    stable | phase | fanout | fault | chain) ;;
     *) echo "unknown workload: $2" >&2; exit 2 ;;
     esac
     select_workload "$2"
