@@ -30,7 +30,12 @@
 #   A   LVP disabled
 #   B   enableLVP, no address speculation (prediction only)
 #   C   enableLVP and address speculation, confined to sum_slots()
-#   CL  C again, logging the LVP events instead of the committed trace
+#   CL  C again, logging the LVP events instead of the committed trace.  For
+#       the phase and fanout workloads, which recover from wrong predictions,
+#       the branch predictor events (the Branch debug flag) are logged too,
+#       so that the checker can see the Fetch2 recovery hook run.  That adds
+#       a line or more for every committed instruction, so the stable
+#       workload, which has no recovery, does not log them.
 
 set -euo pipefail
 
@@ -404,7 +409,11 @@ run_workload()
     run_gem5 A "$TRACE"
     run_gem5 B "$TRACE" "${LVP_ON[@]}" -P 'system.cpu[0].lvpSpecAddr=False'
     run_gem5 C "$TRACE" "${LVP_ON[@]}" "${SPEC[@]}"
-    run_gem5 CL LVP "${LVP_ON[@]}" "${SPEC[@]}"
+    local cl_flags=LVP
+    if [ "$WORKLOAD" != stable ]; then
+        cl_flags=LVP,Branch
+    fi
+    run_gem5 CL "$cl_flags" "${LVP_ON[@]}" "${SPEC[@]}"
 
     python3 -I "$CHECKER" "$WOUT" "$WORKLOAD"
 }

@@ -7,6 +7,8 @@ phase (the pointer alternates between two nodes in blocks of 64 slots, so
 confident predictions are wrong at the start of each block and recovery is
 exercised) or fanout (phase, with two dependent loads from each pointer, so
 that one wrong prediction can be used by two speculative loads); see ldld.c.
+The phase and fanout runs also check the Fetch2 recovery hook, from the
+Branch debug flag that the runner enables for their CL run.
 
 OUT holds, for each run name A, B, C and CL, the directory OUT/<name> that
 gem5 wrote, and OUT/<name>.out and OUT/<name>.rc with its output and exit
@@ -629,6 +631,350 @@ def fanout_checks(
     )
 
 
+# Messages of the Fetch2 recovery hook and of the branch predictor calls it
+# makes, as the Branch debug flag prints them (src/cpu/minor/fetch2.cc,
+# src/cpu/pred/bpred_unit.cc).  Each is preceded by "<tick>: <object>: ".
+INST_ID = r"(\d+)/(\d+)\.(\d+)/(\d+)/(\d+)\.(\d+) pc: 0x([0-9a-f]+)"
+HOOK_RE = re.compile(r"^\s*(\d+):.*LVP recovery redirect inst: " + INST_ID)
+# BPredUnit::squash(sn, tid) prints, for each history entry it removes, an
+# optional return address stack line, then the entry and the size left:
+#   [tid:T] [squash sn:N] Removing history for [sn:M] PC ...
+#   [tid:T] [squash sn:N] predHist.size(): S
+SQUASH_RE = re.compile(r"\[tid:(\d+)\] \[squash sn:(\d+)\] (.*)$")
+REMOVING_RE = re.compile(r"Removing history for \[sn:(\d+)\] PC ")
+SIZE_RE = re.compile(r"predHist\.size\(\): (\d+)\s*$")
+RAS_RE = re.compile(r"(Squashing\s+Call \[sn:|Restoring top of RAS)")
+# BPredUnit::update(sn, tid) always prints, then retires histories silently
+COMMIT_RE = re.compile(r"\[tid:(\d+)\] Committing branches until sn:(\d+)\]")
+# BPredUnit::predict prints when it has added a history entry
+PUSH_RE = re.compile(
+    r"\[tid:(\d+)\] \[sn:(\d+)\] History entry added\. "
+    r"predHist\.size\(\): (\d+)\s*$"
+)
+
+
+def parse_hook_log(path):
+    """The Fetch2 recovery hooks in a Branch debug log, and what each did.
+
+    The hook (Fetch2::updateBranchPrediction) prints one line and then makes
+    two calls with nothing in between: BPredUnit::squash(N, tid), which
+    prints for each entry it removes and nothing if it removes none, and
+    BPredUnit::update(N, tid), which always prints.  So between the hook's
+    line and the update's line there may be only the squash's lines, and
+    anything else is reported as a problem.  After the update the history of
+    the thread is empty (the squash leaves only entries up to N, and the
+    update retires every entry up to N), so the next entry that predict adds
+    for the thread must find the history empty.  That entry is evidence for
+    one hook only: if another hook of the thread comes before it, nothing
+    shows what the earlier hook left, because the later one empties the
+    history whatever it was.  The earlier hook is then marked ambiguous and
+    its history is not checked, and the checker fails.
+
+    Returns (hooks, problems).  hooks maps the hook's (thread, exec) to a
+    dict, and problems lists everything that was not as expected.
+    """
+    hooks = {}
+    problems = []
+    block = None  # the hook whose calls are being read
+    awaiting = {}  # thread -> its last hook, still to see a history entry
+
+    with open(path) as f:
+        for lineno, line in enumerate(f):
+            if block is not None:
+                # Only the calls of the hook can print here
+                m = SQUASH_RE.search(line)
+                if m:
+                    tid, sn, text = (
+                        int(m.group(1)),
+                        int(m.group(2)),
+                        m.group(3),
+                    )
+                    if (tid, sn) != (block["tid"], block["fetch"]):
+                        problems.append(
+                            "line %d: squash message for tid %d sn %d inside "
+                            "the hook of tid %d sn %d"
+                            % (lineno, tid, sn, block["tid"], block["fetch"])
+                        )
+                    r = REMOVING_RE.search(text)
+                    s = SIZE_RE.search(text)
+                    if block["expect_size"] and not s:
+                        problems.append(
+                            "line %d: a removal was not followed by its size"
+                            % lineno
+                        )
+                        block["expect_size"] = False
+                    if r:
+                        block["removed"].append(int(r.group(1)))
+                        block["expect_size"] = True
+                    elif s:
+                        if not block["expect_size"]:
+                            problems.append(
+                                "line %d: a size without a removal" % lineno
+                            )
+                        block["expect_size"] = False
+                        block["sizes"].append(int(s.group(1)))
+                    elif RAS_RE.search(text):
+                        block["ras"] += 1
+                    else:
+                        problems.append(
+                            "line %d: unexpected squash message: %s"
+                            % (lineno, line.strip()[:120])
+                        )
+                    continue
+                m = COMMIT_RE.search(line)
+                if m:
+                    if block["expect_size"]:
+                        problems.append(
+                            "line %d: the update came before the size of "
+                            "the last removal" % lineno
+                        )
+                    block["commit"] = (int(m.group(1)), int(m.group(2)))
+                    block["commit_line"] = lineno
+                    awaiting[block["tid"]] = block
+                    block = None
+                    continue
+                problems.append(
+                    "line %d: unexpected message between the hook and its "
+                    "update: %s" % (lineno, line.strip()[:120])
+                )
+                continue
+
+            if "LVP recovery redirect" in line:
+                m = HOOK_RE.match(line)
+                if not m:
+                    problems.append(
+                        "line %d: unparsable hook line: %s"
+                        % (lineno, line.strip()[:120])
+                    )
+                    continue
+                g = m.groups()
+                key = (int(g[1]), int(g[6]))
+                if key in hooks:
+                    problems.append("hook for %s seen twice" % (key,))
+                # An earlier hook of this thread that has not seen a history
+                # entry yet can no longer be told apart from this one
+                earlier = awaiting.pop(int(g[1]), None)
+                if earlier is not None:
+                    earlier["ambiguous"] = key
+                block = {
+                    "key": key,
+                    "line": lineno,
+                    "tick": int(g[0]),
+                    "tid": int(g[1]),
+                    "fetch": int(g[5]),
+                    "pc": int(g[7], 16),
+                    "removed": [],
+                    "sizes": [],
+                    "ras": 0,
+                    "expect_size": False,
+                    "commit": None,
+                    "commit_line": None,
+                    "next_push": None,
+                    "ambiguous": None,
+                }
+                hooks[key] = block
+            elif "History entry added" in line:
+                m = PUSH_RE.search(line)
+                if m:
+                    tid, sn, size = (int(x) for x in m.groups())
+                    hook = awaiting.pop(tid, None)
+                    if hook is not None:
+                        hook["next_push"] = (sn, size)
+                else:
+                    # The entry that this line stands for can't be read, so
+                    # no waiting hook may take a later entry in its place:
+                    # they are dropped and are reported as having none
+                    problems.append(
+                        "line %d: malformed history entry line: %s"
+                        % (lineno, line.strip()[:120])
+                    )
+                    awaiting.clear()
+
+    if block is not None:
+        problems.append(
+            "the log ends inside the hook of %s (no update)" % (block["key"],)
+        )
+    return hooks, problems
+
+
+def hook_checks(path, redirects, val_pc, cl):
+    """The Fetch2 recovery hook, from the Branch debug log of the CL run: for
+    every LVP recovery redirect the hook ran, called squash and update with
+    the producer's fetch sequence number, and left the thread's branch
+    history empty.  Only valid when the CL run logged the Branch flag.
+
+    What the log can and cannot show: update() always prints, but squash()
+    prints nothing when there is no younger history to remove, so a squash
+    that removed nothing is not seen.  The emptiness of the history after
+    the hook is observed through the size that predict reports when it adds
+    the next entry: it is 1 only if no entry was left by either call, so a
+    squash that left a younger entry, or an update that left an older one,
+    would show as a larger size.  That is the combined effect of the two
+    calls, not a separate proof of what each does.
+
+    Limitation: in the current phase and fanout workloads, the squash of
+    each recovery removes every younger history entry and leaves the history
+    empty (the size after the last removal is 0), before the update runs.
+    So these tests do not exercise the update retiring older, uncommitted
+    history entries.  That part of the hook is supported by reading
+    BPredUnit::update(), not demonstrated by these workloads."""
+    section("Fetch2 recovery hook (Branch debug log of CL)")
+
+    hooks, problems = parse_hook_log(path)
+
+    # 1. One hook for each recovery redirect of the Execute stage
+    check(
+        len(hooks) == len(redirects) == cl["mispredictSquashes"],
+        "CL: hooks (%d) = recovery redirects logged (%d) = "
+        "mispredictSquashes (%d)"
+        % (len(hooks), len(redirects), cl["mispredictSquashes"]),
+    )
+    missing = sorted(set(redirects) - set(hooks))
+    extra = sorted(set(hooks) - set(redirects))
+    check(
+        not missing and not extra,
+        "CL: the hooks are exactly the recovery redirects, by (thread, exec) "
+        "(%d redirects without a hook, %d hooks without a redirect)"
+        % (len(missing), len(extra)),
+    )
+    for key in (missing + extra)[:5]:
+        report("unmatched: %s" % (key,))
+    both = [k for k in hooks if k in redirects]
+    late = [k for k in both if not redirects[k] < hooks[k]["line"]]
+    check(
+        not late,
+        "CL: every hook is logged after its redirect (%d are not)" % len(late),
+    )
+    wrong_pc = [k for k in both if val_pc.get(k) != hooks[k]["pc"]]
+    check(
+        not wrong_pc,
+        "CL: every hook is for the instruction that was validated (%d are "
+        "not)" % len(wrong_pc),
+    )
+
+    # 2. The synchronous block of each hook
+    check(
+        not problems,
+        "CL: the hook log is as expected: only squash lines between a hook "
+        "and its update, and well formed history entry lines (%d problems)"
+        % len(problems),
+    )
+    for p in problems[:5]:
+        report("hook log: " + p)
+    unclosed = [k for k, h in hooks.items() if h["commit"] is None]
+    wrong_update = [
+        k
+        for k, h in hooks.items()
+        if h["commit"] is not None and h["commit"] != (h["tid"], h["fetch"])
+    ]
+    check(
+        not unclosed and not wrong_update,
+        "CL: every hook is followed by an update of the same thread and "
+        "sequence number (%d without an update, %d with another)"
+        % (len(unclosed), len(wrong_update)),
+    )
+
+    # 3. What the squash removed: only entries younger than the recovery,
+    # youngest first, and each removal leaves one entry fewer
+    not_younger = [
+        k
+        for k, h in hooks.items()
+        if any(m <= h["fetch"] for m in h["removed"])
+    ]
+    check(
+        not not_younger,
+        "CL: every history entry removed is younger than the recovery "
+        "(%d hooks removed an older one)" % len(not_younger),
+    )
+    not_descending = [
+        k
+        for k, h in hooks.items()
+        if any(a <= b for a, b in zip(h["removed"], h["removed"][1:]))
+    ]
+    check(
+        not not_descending,
+        "CL: entries are removed youngest first (%d hooks are not)"
+        % len(not_descending),
+    )
+    bad_sizes = [
+        k
+        for k, h in hooks.items()
+        if len(h["sizes"]) != len(h["removed"])
+        or any(b != a - 1 for a, b in zip(h["sizes"], h["sizes"][1:]))
+        or (h["sizes"] and h["sizes"][-1] < 0)
+    ]
+    check(
+        not bad_sizes,
+        "CL: the history size falls by one with each removal (%d hooks do "
+        "not)" % len(bad_sizes),
+    )
+
+    # 4. The history is empty afterwards: the next entry added is the only
+    # one, and it is for a younger instruction.  Each history entry is
+    # evidence for the last hook before it only; a hook that another hook of
+    # its thread followed before any entry cannot be checked
+    ambiguous = [k for k, h in hooks.items() if h["ambiguous"] is not None]
+    check(
+        not ambiguous,
+        "CL: no hook is followed by another hook of its thread before a "
+        "history entry, which would leave its own history unchecked "
+        "(%d are)" % len(ambiguous),
+    )
+    for key in ambiguous[:5]:
+        report(
+            "ambiguous: the hook of %s was followed by the hook of %s "
+            "before any history entry" % (key, hooks[key]["ambiguous"])
+        )
+    no_push = [
+        k
+        for k, h in hooks.items()
+        if h["next_push"] is None and h["ambiguous"] is None
+    ]
+    check(
+        not no_push,
+        "CL: a history entry is added after every hook (%d hooks have none)"
+        % len(no_push),
+    )
+    for key in no_push[:5]:
+        report("no history entry after the hook of %s" % (key,))
+    pushed = [(k, h) for k, h in hooks.items() if h["next_push"] is not None]
+    not_empty = [k for k, h in pushed if h["next_push"][1] != 1]
+    check(
+        not not_empty,
+        "CL: the next history entry after every hook finds the history "
+        "empty, size 1 (%d hooks left it non-empty)" % len(not_empty),
+    )
+    for key in not_empty[:5]:
+        report(
+            "hook %s: next entry sn %d size %d"
+            % ((key,) + hooks[key]["next_push"])
+        )
+    not_new = [k for k, h in pushed if not h["next_push"][0] > h["fetch"]]
+    check(
+        not not_new,
+        "CL: the next history entry after every hook is for a younger "
+        "instruction (%d are not)" % len(not_new),
+    )
+
+    # 5. The squash removed something at least once (a removal is the only
+    # sign that squash ran, so a hook with none proves nothing either way)
+    counts = collections.Counter(len(h["removed"]) for h in hooks.values())
+    check(
+        any(n > 0 for n in counts),
+        "CL: at least one hook removed history entries (%d of %d did)"
+        % (len(hooks) - counts.get(0, 0), len(hooks)),
+    )
+    report(
+        "hooks by history entries removed: "
+        + ", ".join("%d x%d" % kv for kv in sorted(counts.items()))
+    )
+    report(
+        "%d hooks logged no removal: squash either had nothing to remove or "
+        "its output is not visible, which the log cannot tell apart"
+        % counts.get(0, 0)
+    )
+
+
 def main():
     if len(sys.argv) not in (2, 3) or (
         len(sys.argv) == 3 and sys.argv[2] not in EXPECTED_CHECKSUMS
@@ -947,6 +1293,12 @@ def main():
             redirects,
             pred_outcome,
             cons_outcome,
+        )
+        hook_checks(
+            os.path.join(out, "CL", "trace.txt"),
+            redirects,
+            val_pc,
+            lvp(stats["CL"]),
         )
         if workload == "fanout":
             fanout_checks(
