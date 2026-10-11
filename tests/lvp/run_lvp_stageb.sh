@@ -18,7 +18,9 @@
 # WORKLOAD is stable (every slot holds the same pointer), phase (the
 # pointer alternates between two nodes in blocks of 64 slots, so used
 # predictions are wrong and recovery is exercised), fanout (phase, with two
-# dependent loads from each pointer) or all (the default, all three).
+# dependent loads from each pointer), fault (a wrong prediction that
+# points into a page that has been unmapped, so that the speculative load
+# that uses it takes a translation fault) or all (the default, all four).
 # Each is a separate binary built from ldld.c, with the address speculation
 # window taken from the symbol table of its own binary.
 #
@@ -31,7 +33,8 @@
 #   B   enableLVP, no address speculation (prediction only)
 #   C   enableLVP and address speculation, confined to sum_slots()
 #   CL  C again, logging the LVP events instead of the committed trace.  For
-#       the phase and fanout workloads, which recover from wrong predictions,
+#       the phase, fanout and fault workloads, which recover from wrong
+#       predictions,
 #       the branch predictor events (the Branch debug flag) are logged too,
 #       so that the checker can see the Fetch2 recovery hook run.  That adds
 #       a line or more for every committed instruction, so the stable
@@ -65,6 +68,7 @@ select_workload()
     stable) DEFS=(); CONSUMERS=1 ;;
     phase) DEFS=(-DLVP_PHASE); CONSUMERS=1 ;;
     fanout) DEFS=(-DLVP_PHASE -DLVP_FANOUT); CONSUMERS=2 ;;
+    fault) DEFS=(-DLVP_FAULT); CONSUMERS=1 ;;
     *) echo "unknown workload: $1" >&2; exit 2 ;;
     esac
     WORKLOAD=$1
@@ -382,8 +386,8 @@ run_gem5()
 workloads()
 {
     case ${1:-all} in
-    all) echo stable phase fanout ;;
-    stable | phase | fanout) echo "$1" ;;
+    all) echo stable phase fanout fault ;;
+    stable | phase | fanout | fault) echo "$1" ;;
     *) echo "unknown workload: $1" >&2; exit 2 ;;
     esac
 }
@@ -448,7 +452,7 @@ run)
 run-one)
     [ $# -eq 2 ] || usage
     case $2 in
-    stable | phase | fanout) ;;
+    stable | phase | fanout | fault) ;;
     *) echo "unknown workload: $2" >&2; exit 2 ;;
     esac
     select_workload "$2"

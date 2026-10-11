@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Checks the outputs of run_lvp_stageb.sh.
-Usage: check_lvp_stageb.py OUT [stable|phase|fanout]
+Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault]
 
 The workload is stable (every slot holds the same pointer, the default) or
 phase (the pointer alternates between two nodes in blocks of 64 slots, so
 confident predictions are wrong at the start of each block and recovery is
 exercised) or fanout (phase, with two dependent loads from each pointer, so
-that one wrong prediction can be used by two speculative loads); see ldld.c.
+that one wrong prediction can be used by two speculative loads) or fault (a
+wrong prediction that points into a page that has been unmapped, so the
+speculative load that uses it takes a translation fault that must not be
+taken); see ldld.c.
 The phase and fanout runs also check the Fetch2 recovery hook, from the
 Branch debug flag that the runner enables for their CL run.
 
@@ -66,13 +69,43 @@ def fanout_sums():
     return lo, hi
 
 
+# fault: FAULT_CYCLES cycles of: map the page at FAULT_ADDR, call sum_slots()
+# over FAULT_TRAIN slots that point to the node in it (v[3] = 7), unmap the
+# page, call sum_slots() over FAULT_USE slots that point to node B (v[3] =
+# 11).  The values below are those of ldld.c.
+FAULT_ADDR = 0x20000000
+FAULT_PAGE = 4096
+FAULT_CYCLES = 32
+FAULT_TRAIN = 8
+FAULT_USE = 3
+FAULT_VALUES = (7, 11)  # v[3] of the node in the page, and of node B
+FAULT_OFFSET = 24  # of v[3] in a node
+
+
+def fault_checksum():
+    """The program's sum, from the structure of its cycles"""
+    total = 0
+    for _ in range(FAULT_CYCLES):
+        total += FAULT_TRAIN * FAULT_VALUES[0]
+        total += FAULT_USE * FAULT_VALUES[1]
+    return total
+
+
 EXPECTED_CHECKSUMS = {
     "stable": 7 * NUM_SLOTS,
     "phase": (7 + 11) * (NUM_SLOTS // 2),
     "fanout": fanout_sums()[0] + (fanout_sums()[1] << 32),
+    "fault": fault_checksum(),
 }
 # The loads in sum_slots() for each slot: the producer and its consumers
-LOADS_PER_SLOT = {"stable": 2, "phase": 2, "fanout": 3}
+LOADS_PER_SLOT = {"stable": 2, "phase": 2, "fanout": 3, "fault": 2}
+# How many times sum_slots() runs its loop in the whole program
+ITERATIONS = {
+    "stable": NUM_SLOTS,
+    "phase": NUM_SLOTS,
+    "fanout": NUM_SLOTS,
+    "fault": FAULT_CYCLES * (FAULT_TRAIN + FAULT_USE),
+}
 
 # The statistics that the comparisons use
 BASE_STATS = ["simInsts", "system.cpu.numCycles"]
@@ -162,7 +195,7 @@ def trace_inventory(path):
     are not an instruction.  None if the trace can't be read.  A line is
         system.cpu: 0x<pc>   : <mnemonic> <operands> : ...
     """
-    inv = {"instructions": 0, "loads": {}, "unparsed": []}
+    inv = {"instructions": 0, "loads": {}, "load_addrs": {}, "unparsed": []}
     try:
         with open(path) as f:
             for line in f:
@@ -176,6 +209,11 @@ def trace_inventory(path):
                 if LOAD_MNEMONIC.match(m.group(2)):
                     pc = int(m.group(1), 16)
                     inv["loads"][pc] = inv["loads"].get(pc, 0) + 1
+                    ea = re.search(r"\bA=0x([0-9a-f]+)", line)
+                    if ea:
+                        addrs = inv["load_addrs"].setdefault(pc, {})
+                        a = int(ea.group(1), 16)
+                        addrs[a] = addrs.get(a, 0) + 1
     except (OSError, UnicodeDecodeError) as e:
         report("cannot read %s: %s" % (path, e))
         return None
@@ -345,6 +383,7 @@ def phase_checks(
     redirects,
     pred_outcome,
     cons_outcome,
+    boundaries,
 ):
     """Expectations from the phase-change program ldld.c (-DLVP_PHASE): the
     producer's pointer changes at the start of every block of 64 slots, so a
@@ -492,11 +531,11 @@ def phase_checks(
         "producer's redirect (%d were not)" % len(unexplained),
     )
     report(
-        "recovery redirects: %d of %d block boundaries; speculative loads: "
-        "%d committed, %d squashed"
+        "recovery redirects: %d of %d changes of the pointer; speculative "
+        "loads: %d committed, %d squashed"
         % (
             len(redirects),
-            NUM_SLOTS // PHASE_BLOCK - 1,
+            boundaries,
             c["specLoadsCommitted"],
             c["specLoadsSquashed"],
         )
@@ -797,7 +836,7 @@ def parse_hook_log(path):
     return hooks, problems
 
 
-def hook_checks(path, redirects, val_pc, cl):
+def hook_checks(path, redirects, val_pc, cl, workload):
     """The Fetch2 recovery hook, from the Branch debug log of the CL run: for
     every LVP recovery redirect the hook ran, called squash and update with
     the producer's fetch sequence number, and left the thread's branch
@@ -812,12 +851,18 @@ def hook_checks(path, redirects, val_pc, cl):
     would show as a larger size.  That is the combined effect of the two
     calls, not a separate proof of what each does.
 
-    Limitation: in the current phase and fanout workloads, the squash of
-    each recovery removes every younger history entry and leaves the history
-    empty (the size after the last removal is 0), before the update runs.
-    So these tests do not exercise the update retiring older, uncommitted
-    history entries.  That part of the hook is supported by reading
-    BPredUnit::update(), not demonstrated by these workloads."""
+    Coverage differs between the workloads.  In phase and fanout the squash
+    of each recovery removes every younger history entry and leaves the
+    history empty (the size after the last removal is 0) before the update
+    runs, so those workloads do not exercise the update retiring an older,
+    uncommitted history entry.  In fault the squash leaves exactly one older
+    entry (the size after the last removal is 1), which the update retires,
+    and the next entry that predict adds finds the history empty and a size
+    of 1: that is asserted for the fault workload, for every hook.  Even so,
+    it is the combined effect of the squash and the update that is seen, and
+    only for one older entry; what the update does with several, or with
+    the predictor tables, is supported by reading BPredUnit::update(), not
+    demonstrated here."""
     section("Fetch2 recovery hook (Branch debug log of CL)")
 
     hooks, problems = parse_hook_log(path)
@@ -956,6 +1001,34 @@ def hook_checks(path, redirects, val_pc, cl):
         "instruction (%d are not)" % len(not_new),
     )
 
+    # 4b. The fault workload's recoveries leave an older entry for the
+    # update to retire: the size after the squash's last removal is exactly
+    # 1, and the next entry is for a younger instruction and finds the
+    # history empty.  A hook that logged no removal has no size to show.
+    if workload == "fault":
+        not_retired = [
+            k
+            for k, h in hooks.items()
+            if not h["sizes"]
+            or h["sizes"][-1] != 1
+            or h["next_push"] is None
+            or h["next_push"][0] <= h["fetch"]
+            or h["next_push"][1] != 1
+        ]
+        check(
+            not not_retired,
+            "CL (fault): every hook's squash left exactly one older history "
+            "entry before the update (size 1 after the last removal), and "
+            "the next entry, for a younger instruction, found the history "
+            "empty (size 1) (%d hooks do not)" % len(not_retired),
+        )
+        for key in not_retired[:5]:
+            h = hooks[key]
+            report(
+                "hook %s: sizes %s, next entry %s"
+                % (key, h["sizes"], h["next_push"])
+            )
+
     # 5. The squash removed something at least once (a removal is the only
     # sign that squash ran, so a hook with none proves nothing either way)
     counts = collections.Counter(len(h["removed"]) for h in hooks.values())
@@ -972,6 +1045,140 @@ def hook_checks(path, redirects, val_pc, cl):
         "%d hooks logged no removal: squash either had nothing to remove or "
         "its output is not visible, which the log cannot tell apart"
         % counts.get(0, 0)
+    )
+
+
+def fault_checks(
+    c,
+    accepted,
+    acc_line,
+    acc_fault,
+    acc_src,
+    val_line,
+    redirects,
+    pred_outcome,
+    cons_outcome,
+):
+    """Expectations from the fault program ldld.c (-DLVP_FAULT): in each of
+    its cycles the producer's last prediction points into a page that has
+    been unmapped, so a speculative consumer that used it has taken a
+    translation fault, which is recorded in the instruction and is taken
+    only if the instruction reaches its response.  It must not: the
+    producer's prediction is found out, the redirect discards the consumer,
+    and its response is dropped.  The consumers that have faulted are found
+    from the acceptance lines of the CL log, which print
+    "(translation fault: ...)" for them.
+
+    The number of cycles in which a consumer is accepted with a fault is not
+    assumed: it is reported against the number of cycles."""
+    section("Expectations from the fault program ldld.c (unmapped page)")
+
+    faulting = [cons for cons, faulted in acc_fault.items() if faulted]
+    check(
+        len(faulting) >= 1,
+        "CL: at least one speculative consumer was accepted with a "
+        "translation fault (%d)" % len(faulting),
+    )
+    report(
+        "speculative consumers accepted with a translation fault: %d in %d "
+        "cycles" % (len(faulting), FAULT_CYCLES)
+    )
+
+    outside = [
+        cons
+        for cons in faulting
+        if acc_src[cons] is None
+        or not FAULT_ADDR <= acc_src[cons] < FAULT_ADDR + FAULT_PAGE
+    ]
+    check(
+        not outside,
+        "CL: the source of every faulting consumer is in the unmapped page "
+        "[0x%x, 0x%x) (%d are not)"
+        % (FAULT_ADDR, FAULT_ADDR + FAULT_PAGE, len(outside)),
+    )
+
+    producer_of = {cons: prod for _, cons, prod in accepted}
+    bad = []
+    for cons in faulting:
+        prod = producer_of[cons]
+        why = []
+        outcome = cons_outcome.get(cons)
+        if outcome is None:
+            why.append("no outcome")
+        elif outcome[1] != "squashed":
+            why.append("outcome %s" % outcome[1])
+        if pred_outcome.get(prod) != "incorrect":
+            why.append("producer outcome %s" % pred_outcome.get(prod))
+        if prod not in redirects:
+            why.append("no recovery redirect for the producer")
+        else:
+            if prod not in val_line or not (
+                acc_line[cons] < val_line[prod] < redirects[prod]
+            ):
+                why.append("acceptance, validation, redirect out of order")
+            if outcome is not None and not outcome[0] > redirects[prod]:
+                why.append("squashed before the redirect")
+        if why:
+            bad.append((cons, why))
+    check(
+        not bad,
+        "CL: every faulting consumer was accepted before its producer was "
+        "validated as incorrect, and was squashed after the recovery "
+        "redirect, never committed (%d are not)" % len(bad),
+    )
+    for cons, why in bad[:5]:
+        report("faulting consumer %s: %s" % (cons, "; ".join(why)))
+
+    check(
+        c["specLoadsFaulted"] == 0,
+        "C: no speculative load committed with a fault: the translation "
+        "fault never reached the architectural fault path (%d did)"
+        % c["specLoadsFaulted"],
+    )
+    producers = {producer_of[cons] for cons in faulting}
+    check(
+        c["mispredictSquashes"] >= len(producers),
+        "C: at least one recovery redirect for each producer of a faulting "
+        "consumer (%d redirects, %d producers)"
+        % (c["mispredictSquashes"], len(producers)),
+    )
+    report(
+        "recovery redirects: %d, faulting consumers: %d, cycles: %d"
+        % (c["mispredictSquashes"], len(faulting), FAULT_CYCLES)
+    )
+
+
+def fault_trace_checks(inv, consumer_pcs):
+    """What A's committed trace says about the consumer of the fault
+    program: it loaded from the node in the page in the training calls and
+    from node B in the last call of each cycle, so the consumers that were
+    fetched again after a recovery loaded from B.  The program's own
+    structure gives the numbers, and the trace is the same in all of A, B
+    and C."""
+    (consumer_pc,) = consumer_pcs
+    addrs = inv["load_addrs"].get(consumer_pc, {})
+    in_page = FAULT_ADDR + FAULT_OFFSET
+    check(
+        len(addrs) == 2,
+        "A trace: the consumer committed loads from exactly two addresses "
+        "(%s)" % ", ".join("0x%x" % a for a in sorted(addrs)),
+    )
+    check(
+        addrs.get(in_page) == FAULT_CYCLES * FAULT_TRAIN,
+        "A trace: %d consumer loads from the node in the page, 0x%x (found "
+        "%s)" % (FAULT_CYCLES * FAULT_TRAIN, in_page, addrs.get(in_page)),
+    )
+    others = {a: n for a, n in addrs.items() if a != in_page}
+    check(
+        len(others) == 1
+        and all(not FAULT_ADDR <= a < FAULT_ADDR + FAULT_PAGE for a in others)
+        and sum(others.values()) == FAULT_CYCLES * FAULT_USE,
+        "A trace: %d consumer loads, every one from the same address "
+        "outside the unmapped page, that of node B (found %s)"
+        % (
+            FAULT_CYCLES * FAULT_USE,
+            ", ".join("0x%x x%d" % kv for kv in sorted(others.items())),
+        ),
     )
 
 
@@ -1132,6 +1339,8 @@ def main():
     accepted = []  # (tick, (thread, exec), (thread, producer exec))
     validated = {}  # (thread, exec) -> tick
     acc_pc = {}  # consumer (thread, exec) -> its PC
+    acc_fault = {}  # consumer -> its acceptance line shows a translation fault
+    acc_src = {}  # consumer -> the predicted source value it used
     val_pc = {}  # validated producer (thread, exec) -> its PC
     # Where each event is in the log, which orders events with the same tick
     acc_line = {}  # consumer (thread, exec) -> line number
@@ -1152,6 +1361,15 @@ def main():
                 )
                 acc_line[(int(g[1]), int(g[6]))] = lineno
                 acc_pc[(int(g[1]), int(g[6]))] = int(g[7], 16)
+                # The instruction prints "(translation fault: ...)" instead
+                # of its name once its translation has faulted
+                acc_fault[(int(g[1]), int(g[6]))] = (
+                    "(translation fault:" in line
+                )
+                src = re.search(r"source: 0x([0-9a-f]+)", line)
+                acc_src[(int(g[1]), int(g[6]))] = (
+                    int(src.group(1), 16) if src else None
+                )
                 continue
             m = val_re.match(line)
             if m:
@@ -1293,12 +1511,16 @@ def main():
             redirects,
             pred_outcome,
             cons_outcome,
+            NUM_SLOTS // PHASE_BLOCK - 1
+            if workload != "fault"
+            else FAULT_CYCLES,
         )
         hook_checks(
             os.path.join(out, "CL", "trace.txt"),
             redirects,
             val_pc,
             lvp(stats["CL"]),
+            workload,
         )
         if workload == "fanout":
             fanout_checks(
@@ -1311,6 +1533,18 @@ def main():
                 val_line,
                 val_pc,
                 redirects,
+                cons_outcome,
+            )
+        if workload == "fault":
+            fault_checks(
+                c,
+                accepted,
+                acc_line,
+                acc_fault,
+                acc_src,
+                val_line,
+                redirects,
+                pred_outcome,
                 cons_outcome,
             )
 
@@ -1339,11 +1573,12 @@ def main():
             "simInsts %s)" % (inv["instructions"], stats["A"]["simInsts"]),
         )
         n_loads = LOADS_PER_SLOT[workload]
+        iterations = ITERATIONS[workload]
         total = sum(inv["loads"].values())
         check(
-            total == n_loads * NUM_SLOTS,
+            total == n_loads * iterations,
             "A trace: exactly %d committed loads (found %d)"
-            % (n_loads * NUM_SLOTS, total),
+            % (n_loads * iterations, total),
         )
         check(
             len(inv["loads"]) == n_loads,
@@ -1352,15 +1587,17 @@ def main():
         )
         check(
             inv["loads"]
-            == {pc: NUM_SLOTS for pc in [producer_pc] + consumer_pcs},
+            == {pc: iterations for pc in [producer_pc] + consumer_pcs},
             "A trace: the committed loads are exactly the producer 0x%x "
             "and the consumer(s) %s of the assembly check, %d times each"
             % (
                 producer_pc,
                 ", ".join("0x%x" % pc for pc in consumer_pcs),
-                NUM_SLOTS,
+                iterations,
             ),
         )
+        if workload == "fault":
+            fault_trace_checks(inv, consumer_pcs)
         by_pc = sorted(inv["loads"].items())[:8]
         report(
             "committed loads by PC: "
@@ -1406,8 +1643,10 @@ def main():
         "speculative (%.1f%%)"
         % (
             c["specLoadsCommitted"],
-            n_consumers * NUM_SLOTS,
-            100.0 * c["specLoadsCommitted"] / (n_consumers * NUM_SLOTS),
+            n_consumers * ITERATIONS[workload],
+            100.0
+            * c["specLoadsCommitted"]
+            / (n_consumers * ITERATIONS[workload]),
         )
     )
     if matched:
