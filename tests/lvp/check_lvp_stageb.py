@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Checks the outputs of run_lvp_stageb.sh.
-Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault|chain]
+Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault|chain|threshold]
 
 The workload is stable (every slot holds the same pointer, the default) or
 phase (the pointer alternates between two nodes in blocks of 64 slots, so
@@ -13,6 +13,8 @@ taken) or chain (three dependent loads, L1, L2 and L3, where L2 is both a
 consumer of L1 and a predicted producer for L3); see ldld.c.
 The phase and fanout runs also check the Fetch2 recovery hook, from the
 Branch debug flag that the runner enables for their CL run.
+
+The threshold mode is a separate configuration test (see threshold_main).
 
 OUT holds, for each run name A, B, C and CL, the directory OUT/<name> that
 gem5 wrote, and OUT/<name>.out and OUT/<name>.rc with its output and exit
@@ -1457,13 +1459,201 @@ def chain_trace_checks(inv, producer_pc, consumer_pcs):
     )
 
 
+THRESHOLDS = (1, 2, 3)
+
+
+def read_cpu_config(out, name):
+    """The parameters of [system.cpu] in OUT/<name>/config.ini, as
+    {name: value string}, or None if the file or the section is missing"""
+    try:
+        with open(os.path.join(out, name, "config.ini")) as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    params = None
+    for line in lines:
+        if line.startswith("["):
+            if params is not None:
+                break
+            if line.strip() == "[system.cpu]":
+                params = {}
+        elif params is not None and "=" in line:
+            key, value = line.split("=", 1)
+            params[key.strip()] = value.strip()
+    return params
+
+
+def threshold_main(out):
+    """The confidence-threshold test.  The fault program is run with LVP off
+    (TA) and with prediction only, at lvpConfThreshold 1, 2 and 3 (T1, T2 and
+    T3).  Prediction only changes nothing but the cpu.lvp statistics (the
+    non-LVP statistics and the committed trace must equal TA's, which this
+    checks), so the pipeline's timing is the same in all four runs.  The
+    predictor's table is trained only by committed loads, in program order,
+    and the threshold only decides whether a lookup returns the entry it
+    finds (LastValuePredictor::lookup), so with identical timing every
+    lookup finds the same entry in every run.  Hence:
+      - lookups and trainings are equal across thresholds;
+      - the lookups that are confident at a higher threshold are a subset
+        of those at a lower one, and each of them reaches the same terminal
+        outcome, so confidentPredictions, correct and incorrect never
+        increase with the threshold.
+    No exact counter totals are asserted."""
+    names = ["TA"] + ["T%d" % t for t in THRESHOLDS]
+    runs = names[1:]
+    expected_checksum = fault_checksum()
+
+    section("Preflight: every threshold run completed and wrote its outputs")
+    stats, problems = preflight(out, names, runs)
+    if stats is None:
+        print()
+        print(
+            "%d preflight check(s) failed: nothing was compared"
+            % len(problems)
+        )
+        return 1
+
+    section("Run configuration")
+    for n in names:
+        params = read_cpu_config(out, n)
+        check(
+            params is not None,
+            "%s: [system.cpu] parameters found in config.ini" % n,
+        )
+        if params is None:
+            continue
+        want = (
+            {"enableLVP": "false"}
+            if n == "TA"
+            else {
+                "enableLVP": "true",
+                "lvpSpecAddr": "false",
+                "lvpConfThreshold": n[1:],
+            }
+        )
+        for key, value in want.items():
+            check(
+                params.get(key) == value,
+                "%s: %s is %s (config.ini says %s)"
+                % (n, key, value, params.get(key)),
+            )
+
+    section("Architectural correctness")
+    for n in names:
+        check(
+            checksum(out, n) == expected_checksum,
+            "%s: checksum is %d" % (n, expected_checksum),
+        )
+    non_lvp = {
+        n: {k: v for k, v in stats[n].items() if "cpu.lvp." not in k}
+        for n in names
+    }
+    for n in runs:
+        check(
+            non_lvp["TA"] == non_lvp[n],
+            "TA and %s: identical statistics apart from cpu.lvp." % n,
+        )
+        check(
+            filecmp.cmp(
+                os.path.join(out, "TA", "trace.txt"),
+                os.path.join(out, n, "trace.txt"),
+                shallow=False,
+            ),
+            "TA and %s: identical committed trace" % n,
+        )
+
+    section("Confidence classification (prediction only)")
+    lv = {n: lvp(stats[n]) for n in runs}
+    for n in runs:
+        s = lv[n]
+        check(
+            s["specLoadsIssued"] == 0
+            and s["specLoadsCommitted"] == 0
+            and s["specLoadsFaulted"] == 0
+            and s["specLoadsSquashed"] == 0
+            and s["mispredictSquashes"] == 0,
+            "%s: no speculative loads and no recovery redirects" % n,
+        )
+        check(
+            s["predCarryIn"] == 0 and s["specCarryIn"] == 0,
+            "%s: no live work at any statistics reset" % n,
+        )
+        check(
+            s["confidentPredictions"] + s["predCarryIn"]
+            == s["correct"]
+            + s["incorrect"]
+            + s["predFaulted"]
+            + s["predSquashed"]
+            + s["predInFlight"],
+            "%s: prediction outcomes add up" % n,
+        )
+        check(
+            s["lookups"]
+            >= s["confidentPredictions"]
+            >= s["correct"] + s["incorrect"],
+            "%s: lookups >= confident >= validated" % n,
+        )
+        check(
+            s["lookups"] >= s["trainings"] >= s["correct"] + s["incorrect"],
+            "%s: lookups >= trainings >= validated" % n,
+        )
+    check(
+        all(lv[n]["lookups"] > 0 for n in runs),
+        "every run looked the predictor up (the test is not vacuous)",
+    )
+    for key in ("lookups", "trainings"):
+        check(
+            len({lv[n][key] for n in runs}) == 1,
+            "%s is the same at every threshold (%s)"
+            % (key, ", ".join("%s %d" % (n, lv[n][key]) for n in runs)),
+        )
+    for key in ("confidentPredictions", "correct", "incorrect"):
+        values = [lv[n][key] for n in runs]
+        check(
+            all(a >= b for a, b in zip(values, values[1:])),
+            "%s never increases with the threshold (%s)"
+            % (key, ", ".join("%s %d" % (n, lv[n][key]) for n in runs)),
+        )
+    check(
+        lv[runs[0]]["confidentPredictions"] > 0,
+        "the lowest threshold makes confident predictions "
+        "(a repeated pointer reaches confidence 1 after two trainings)",
+    )
+
+    section("Counters by threshold (reported only)")
+    for key in (
+        "lookups",
+        "confidentPredictions",
+        "correct",
+        "incorrect",
+        "predSquashed",
+        "trainings",
+    ):
+        report(
+            "%s: %s"
+            % (key, ", ".join("%s %d" % (n, lv[n][key]) for n in runs))
+        )
+
+    print()
+    print(
+        "%d correctness check(s) failed" % len(fails)
+        if fails
+        else "all correctness checks passed"
+    )
+    return 1 if fails else 0
+
+
 def main():
     if len(sys.argv) not in (2, 3) or (
-        len(sys.argv) == 3 and sys.argv[2] not in EXPECTED_CHECKSUMS
+        len(sys.argv) == 3
+        and sys.argv[2] not in EXPECTED_CHECKSUMS
+        and sys.argv[2] != "threshold"
     ):
         print(__doc__)
         return 2
     out = sys.argv[1]
+    if len(sys.argv) == 3 and sys.argv[2] == "threshold":
+        return threshold_main(out)
     workload = sys.argv[2] if len(sys.argv) == 3 else "stable"
     expected_checksum = EXPECTED_CHECKSUMS[workload]
     names = ["A", "B", "C", "CL"]

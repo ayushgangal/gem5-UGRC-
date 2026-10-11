@@ -6,6 +6,7 @@
 #   run_lvp_stageb.sh run [WORKLOAD]        check-asm, then run A, B, C and
 #                                           CL and check the results
 #   run_lvp_stageb.sh run-one WORKLOAD      what run does for one workload
+#   run_lvp_stageb.sh threshold             the confidence-threshold test
 #
 # run starts run-one in a separate process for each workload, so that a
 # failure anywhere in one workload (the build, the assembly check, ...)
@@ -24,6 +25,12 @@
 # middle one both a consumer and a producer) or all (the default, all five).
 # Each is a separate binary built from ldld.c, with the address speculation
 # window taken from the symbol table of its own binary.
+#
+# threshold is a separate configuration test, not a workload (all does not
+# include it): the fault program, built into OUT/threshold, is run with LVP
+# off (TA) and with prediction only (no address speculation) at
+# lvpConfThreshold 1, 2 and 3 (T1, T2 and T3), and the checker compares the
+# four runs.
 #
 # OUT (default /tmp/lvp-stage-b) is where everything is written, in a
 # subdirectory for each workload.  gem5 must already be built
@@ -456,7 +463,43 @@ run_workload()
     python3 -I "$CHECKER" "$WOUT" "$WORKLOAD"
 }
 
+run_threshold()
+{
+    # The fault binary, in a directory of its own so that nothing here can
+    # touch the results of the fault workload
+    DEFS=(-DLVP_FAULT)
+    CONSUMERS=1
+    LINKS=1
+    WORKLOAD=threshold
+    WOUT=$OUT/threshold
+    BIN=$WOUT/ldld
+    WIN_BEGIN=
+    WIN_END=
+    mkdir -p "$WOUT"
+    local n
+    for n in TA T1 T2 T3; do
+        rm -rf "${WOUT:?}/$n"
+        rm -f "${WOUT:?}/$n.out" "${WOUT:?}/$n.rc"
+    done
+    check_asm
+
+    local trace=ExecEnable,ExecUser,ExecFaulting,ExecResult,ExecEffAddr,FmtTicksOff
+    run_gem5 TA "$trace"
+    local t
+    for t in 1 2 3; do
+        run_gem5 "T$t" "$trace" -P 'system.cpu[0].enableLVP=True' \
+            -P 'system.cpu[0].lvpSpecAddr=False' \
+            -P "system.cpu[0].lvpConfThreshold=$t"
+    done
+
+    python3 -I "$CHECKER" "$WOUT" threshold
+}
+
 case ${1:-} in
+threshold)
+    [ $# -eq 1 ] || usage
+    run_threshold
+    ;;
 check-asm)
     [ $# -le 2 ] || usage
     list=$(workloads "${2:-all}")
