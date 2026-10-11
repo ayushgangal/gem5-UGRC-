@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Checks the outputs of run_lvp_stageb.sh.
-Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault|chain|threshold]
+Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault|chain|threshold|
+                               pcwindow|invalid-config]
 
 The workload is stable (every slot holds the same pointer, the default) or
 phase (the pointer alternates between two nodes in blocks of 64 slots, so
@@ -14,7 +15,8 @@ consumer of L1 and a predicted producer for L3); see ldld.c.
 The phase and fanout runs also check the Fetch2 recovery hook, from the
 Branch debug flag that the runner enables for their CL run.
 
-The threshold mode is a separate configuration test (see threshold_main).
+The threshold, pcwindow and invalid-config modes are separate configuration
+tests (see threshold_main, pcwindow_main and invalid_config_main).
 
 OUT holds, for each run name A, B, C and CL, the directory OUT/<name> that
 gem5 wrote, and OUT/<name>.out and OUT/<name>.rc with its output and exit
@@ -1643,17 +1645,383 @@ def threshold_main(out):
     return 1 if fails else 0
 
 
+def check_config(out, name, want):
+    """Check that [system.cpu] of OUT/<name>/config.ini has each parameter in
+    want ({parameter: expected string, or int for an address}).  Addresses
+    are compared as integers, whatever their notation in the file."""
+    params = read_cpu_config(out, name)
+    check(
+        params is not None,
+        "%s: [system.cpu] parameters found in config.ini" % name,
+    )
+    if params is None:
+        return
+    for key, value in want.items():
+        got = params.get(key)
+        if isinstance(value, int):
+            try:
+                same = got is not None and int(got, 0) == value
+            except ValueError:
+                same = False
+            text = "%#x" % value
+        else:
+            same = got == value
+            text = value
+        check(
+            same,
+            "%s: %s is %s (config.ini says %s)" % (name, key, text, got),
+        )
+
+
+PCWINDOW_RUNS = ["BASE", "FULL", "NO_PRODUCER", "NO_CONSUMER"]
+
+
+def pcwindow_main(out):
+    """The PC-window test.  The fault program is run with LVP off (BASE) and
+    with LVP and address speculation under three windows, from the producer
+    and consumer PCs of its own binary (load_pcs.txt; both loads are 4-byte
+    instructions, so consumer + 4 is the end of the consumer):
+      FULL         [producer, consumer + 4)  both loads inside
+      NO_PRODUCER  [consumer, consumer + 4)  producer outside
+      NO_CONSUMER  [producer, consumer)      consumer outside
+    The window is half-open, and Execute::lvpInSpecWindow needs the
+    producer and the consumer of a speculative load inside it, so only FULL
+    can issue speculative loads.  Speculation changes timing but never the
+    committed trace, so every run must match BASE's trace.  FULL's non-LVP
+    statistics (cycles, ...) differ from BASE's by design; those of
+    NO_PRODUCER and NO_CONSUMER, which issue no speculative load, must not.
+    No exact counter totals are asserted."""
+    names = PCWINDOW_RUNS
+    runs = names[1:]
+    expected_checksum = fault_checksum()
+
+    section("Preflight: every PC-window run completed and wrote its outputs")
+    stats, problems = preflight(out, names, runs)
+    if stats is None:
+        print()
+        print(
+            "%d preflight check(s) failed: nothing was compared"
+            % len(problems)
+        )
+        return 1
+
+    pcs, why = read_load_pcs(out, "fault")
+    if pcs is None:
+        check(False, "load PCs from the assembly check: " + why)
+        print()
+        print("the load PCs are unusable: nothing was compared")
+        return 1
+    producer, consumers = pcs
+    consumer = consumers[0]
+    check(
+        consumer > producer,
+        "the consumer (%#x) follows the producer (%#x)" % (consumer, producer),
+    )
+    windows = {
+        "FULL": (producer, consumer + 4),
+        "NO_PRODUCER": (consumer, consumer + 4),
+        "NO_CONSUMER": (producer, consumer),
+    }
+
+    section("Run configuration")
+    check_config(out, "BASE", {"enableLVP": "false"})
+    for n in runs:
+        begin, end = windows[n]
+        check_config(
+            out,
+            n,
+            {
+                "enableLVP": "true",
+                "lvpSpecAddr": "true",
+                "executeAllowEarlyMemoryIssue": "true",
+                "lvpSpecPcBegin": begin,
+                "lvpSpecPcEnd": end,
+            },
+        )
+    full_begin, full_end = windows["FULL"]
+    check(
+        full_begin <= producer < full_end
+        and full_begin <= consumer < full_end,
+        "FULL contains the producer and the consumer",
+    )
+    begin, end = windows["NO_PRODUCER"]
+    check(
+        not begin <= producer < end and begin <= consumer < end,
+        "NO_PRODUCER excludes the producer and contains the consumer",
+    )
+    begin, end = windows["NO_CONSUMER"]
+    check(
+        begin <= producer < end and not begin <= consumer < end,
+        "NO_CONSUMER contains the producer and excludes the consumer",
+    )
+
+    section("Architectural correctness")
+    for n in names:
+        check(
+            checksum(out, n) == expected_checksum,
+            "%s: checksum is %d" % (n, expected_checksum),
+        )
+    for n in runs:
+        check(
+            filecmp.cmp(
+                os.path.join(out, "BASE", "trace.txt"),
+                os.path.join(out, n, "trace.txt"),
+                shallow=False,
+            ),
+            "BASE and %s: identical committed trace" % n,
+        )
+
+    non_lvp = {
+        n: {k: v for k, v in stats[n].items() if "cpu.lvp." not in k}
+        for n in names
+    }
+    for n in ("NO_PRODUCER", "NO_CONSUMER"):
+        check(
+            non_lvp["BASE"] == non_lvp[n],
+            "BASE and %s: identical statistics apart from cpu.lvp." % n,
+        )
+
+    section("Speculation by window")
+    lv = {n: lvp(stats[n]) for n in runs}
+    for n in runs:
+        s = lv[n]
+        check(
+            s["predCarryIn"] == 0
+            and s["specCarryIn"] == 0
+            and s["predInFlight"] == 0
+            and s["specInFlight"] == 0,
+            "%s: no carry-in and nothing in flight at the end" % n,
+        )
+        check(
+            s["confidentPredictions"] + s["predCarryIn"]
+            == s["correct"]
+            + s["incorrect"]
+            + s["predFaulted"]
+            + s["predSquashed"]
+            + s["predInFlight"],
+            "%s: prediction outcomes add up" % n,
+        )
+        check(
+            s["specLoadsIssued"] + s["specCarryIn"]
+            == s["specLoadsCommitted"]
+            + s["specLoadsFaulted"]
+            + s["specLoadsSquashed"]
+            + s["specInFlight"],
+            "%s: speculative load outcomes add up" % n,
+        )
+        check(
+            s["lookups"]
+            >= s["confidentPredictions"]
+            >= s["correct"] + s["incorrect"],
+            "%s: lookups >= confident >= validated" % n,
+        )
+        check(
+            s["lookups"] >= s["trainings"] >= s["correct"] + s["incorrect"],
+            "%s: lookups >= trainings >= validated" % n,
+        )
+        check(
+            s["mispredictSquashes"] <= s["incorrect"],
+            "%s: recovery redirects (%d) <= incorrect predictions (%d)"
+            % (n, s["mispredictSquashes"], s["incorrect"]),
+        )
+    check(
+        lv["FULL"]["specLoadsIssued"] > 0,
+        "FULL: speculative loads were issued (%d)"
+        % lv["FULL"]["specLoadsIssued"],
+    )
+    for n in ("NO_PRODUCER", "NO_CONSUMER"):
+        check(
+            lv[n]["specLoadsIssued"] == 0 and lv[n]["mispredictSquashes"] == 0,
+            "%s: no speculative loads (%d) and no recovery redirects (%d)"
+            % (n, lv[n]["specLoadsIssued"], lv[n]["mispredictSquashes"]),
+        )
+
+    section("Counters by window (reported only)")
+    for key in (
+        "lookups",
+        "trainings",
+        "confidentPredictions",
+        "correct",
+        "incorrect",
+        "specLoadsIssued",
+        "specLoadsCommitted",
+        "specLoadsFaulted",
+        "specLoadsSquashed",
+        "mispredictSquashes",
+    ):
+        report(
+            "%s: %s"
+            % (key, ", ".join("%s %d" % (n, lv[n][key]) for n in runs))
+        )
+
+    print()
+    print(
+        "%d correctness check(s) failed" % len(fails)
+        if fails
+        else "all correctness checks passed"
+    )
+    return 1 if fails else 0
+
+
+# The markers in gem5's output: "fatal: " and "panic: " anywhere in a line
+# (a source location comes before them), and the wrapper that fatal_if adds
+# to a fatal message, which is not a second marker
+FATAL_MARKER = re.compile(r"\bfatal: ")
+PANIC_MARKER = re.compile(r"\bpanic: ")
+FATAL_CONDITION = re.compile(r"^fatal condition .*? occurred: ")
+
+# The configurations that the constructors must refuse: (name, the text of
+# the fatal message, from Execute::Execute and LastValuePredictor).  The
+# fatal in Execute names the stage ("<stage>: "), the predictor's does not.
+INVALID_CONFIGS = [
+    ("spec_without_lvp", "execute", "lvpSpecAddr requires enableLVP"),
+    (
+        "spec_without_early_issue",
+        "execute",
+        "lvpSpecAddr requires executeAllowEarlyMemoryIssue",
+    ),
+    (
+        "window_without_spec",
+        "execute",
+        "lvpSpecPcBegin and lvpSpecPcEnd require lvpSpecAddr",
+    ),
+    (
+        "window_begin_after_end",
+        "execute",
+        "lvpSpecPcBegin (0x10200) must be below lvpSpecPcEnd (0x10100)",
+    ),
+    (
+        "window_begin_equals_end",
+        "execute",
+        "lvpSpecPcBegin (0x10100) must be below lvpSpecPcEnd (0x10100)",
+    ),
+    (
+        "threshold_zero",
+        None,
+        "lvpConfThreshold must be in [1, 3] (got 0)",
+    ),
+    (
+        "threshold_four",
+        None,
+        "lvpConfThreshold must be in [1, 3] (got 4)",
+    ),
+    (
+        "table_not_power_of_two",
+        None,
+        "lvpTableEntries must be a non-zero power of two (got 1000)",
+    ),
+    (
+        "table_zero",
+        None,
+        "lvpTableEntries must be a non-zero power of two (got 0)",
+    ),
+]
+
+
+def invalid_config_main(out):
+    """The invalid-configuration test.  gem5 must refuse each configuration
+    in INVALID_CONFIGS when it builds the CPU, with the fatal message from
+    the source: a nonzero exit status (recorded by the runner in
+    OUT/<name>.rc) and, in OUT/<name>.out, exactly one fatal marker whose
+    message, without the source location before it and the fatal_if
+    "fatal condition ... occurred:" wrapper, is the expected one, and no
+    panic, traceback or program output (an unrelated failure, or a run that
+    went on).  A refused run writes none of the artifacts of a
+    successful one, so none are required."""
+    section("Invalid configurations are refused with the expected message")
+    for name, stage, message in INVALID_CONFIGS:
+        rc_path = os.path.join(out, name + ".rc")
+        status = None
+        try:
+            with open(rc_path) as f:
+                status = int(f.read().strip())
+        except (OSError, ValueError) as e:
+            check(
+                False,
+                "%s: exit status recorded in %s (%s)" % (name, rc_path, e),
+            )
+            continue
+        check(
+            status != 0,
+            "%s: gem5 exit status is nonzero (got %d)" % (name, status),
+        )
+
+        out_path = os.path.join(out, name + ".out")
+        try:
+            with open(out_path) as f:
+                lines = f.read().splitlines()
+        except (OSError, UnicodeDecodeError) as e:
+            check(
+                False, "%s: output can be read (%s: %s)" % (name, out_path, e)
+            )
+            continue
+
+        # gem5 writes "[<source>:<line>: ]fatal: <message>", and fatal_if
+        # puts "fatal condition <condition> occurred: " before the message
+        markers = [
+            line[m.end() :].rstrip()
+            for line in lines
+            for m in FATAL_MARKER.finditer(line)
+        ]
+        expected = re.compile(
+            (r"\S*%s: " % stage if stage else "") + re.escape(message)
+        )
+        check(
+            len(markers) == 1,
+            "%s: exactly one fatal marker (%d)%s"
+            % (
+                name,
+                len(markers),
+                "" if len(markers) < 2 else ": " + markers[1],
+            ),
+        )
+        check(
+            bool(markers)
+            and expected.fullmatch(FATAL_CONDITION.sub("", markers[0]))
+            is not None,
+            "%s: output has the fatal message: %s" % (name, message),
+        )
+        unrelated = [
+            l
+            for l in lines
+            if PANIC_MARKER.search(l)
+            or l.startswith("Traceback")
+            or l.startswith("checksum")
+        ]
+        check(
+            not unrelated,
+            "%s: no panic, traceback or program output (%d)%s"
+            % (
+                name,
+                len(unrelated),
+                "" if not unrelated else ": " + unrelated[0],
+            ),
+        )
+
+    print()
+    print(
+        "%d correctness check(s) failed" % len(fails)
+        if fails
+        else "all correctness checks passed"
+    )
+    return 1 if fails else 0
+
+
 def main():
     if len(sys.argv) not in (2, 3) or (
         len(sys.argv) == 3
         and sys.argv[2] not in EXPECTED_CHECKSUMS
-        and sys.argv[2] != "threshold"
+        and sys.argv[2] not in ("threshold", "pcwindow", "invalid-config")
     ):
         print(__doc__)
         return 2
     out = sys.argv[1]
     if len(sys.argv) == 3 and sys.argv[2] == "threshold":
         return threshold_main(out)
+    if len(sys.argv) == 3 and sys.argv[2] == "pcwindow":
+        return pcwindow_main(out)
+    if len(sys.argv) == 3 and sys.argv[2] == "invalid-config":
+        return invalid_config_main(out)
     workload = sys.argv[2] if len(sys.argv) == 3 else "stable"
     expected_checksum = EXPECTED_CHECKSUMS[workload]
     names = ["A", "B", "C", "CL"]

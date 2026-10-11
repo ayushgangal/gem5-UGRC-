@@ -7,6 +7,8 @@
 #                                           CL and check the results
 #   run_lvp_stageb.sh run-one WORKLOAD      what run does for one workload
 #   run_lvp_stageb.sh threshold             the confidence-threshold test
+#   run_lvp_stageb.sh pcwindow              the PC-window test
+#   run_lvp_stageb.sh invalid-config        the invalid-configuration test
 #
 # run starts run-one in a separate process for each workload, so that a
 # failure anywhere in one workload (the build, the assembly check, ...)
@@ -31,6 +33,18 @@
 # off (TA) and with prediction only (no address speculation) at
 # lvpConfThreshold 1, 2 and 3 (T1, T2 and T3), and the checker compares the
 # four runs.
+#
+# pcwindow is another: the fault program, built into OUT/pcwindow, is run
+# with LVP off (BASE) and with address speculation (the window is the
+# half-open range of lvpSpecPcBegin and lvpSpecPcEnd, and the addresses come
+# from the load_pcs.txt of that binary) over [producer, consumer + 4) (FULL),
+# [consumer, consumer + 4) (NO_PRODUCER) and [producer, consumer)
+# (NO_CONSUMER).  Only FULL can speculate.
+#
+# invalid-config is another: the fault program, built into
+# OUT/invalid-config, is started with each configuration that the
+# constructors must refuse, and the checker requires the exit status and the
+# fatal message.  Neither pcwindow nor invalid-config is part of all.
 #
 # OUT (default /tmp/lvp-stage-b) is where everything is written, in a
 # subdirectory for each workload.  gem5 must already be built
@@ -495,10 +509,117 @@ run_threshold()
     python3 -I "$CHECKER" "$WOUT" threshold
 }
 
+run_pcwindow()
+{
+    DEFS=(-DLVP_FAULT)
+    CONSUMERS=1
+    LINKS=1
+    WORKLOAD=pcwindow
+    WOUT=$OUT/pcwindow
+    BIN=$WOUT/ldld
+    WIN_BEGIN=
+    WIN_END=
+    mkdir -p "$WOUT"
+    local n
+    for n in BASE FULL NO_PRODUCER NO_CONSUMER; do
+        rm -rf "${WOUT:?}/$n"
+        rm -f "${WOUT:?}/$n.out" "${WOUT:?}/$n.rc"
+    done
+    check_asm
+
+    # The window addresses from this binary's own load_pcs.txt
+    local producer consumer
+    producer=$(awk '$1 == "producer" { print $2 }' "$WOUT/load_pcs.txt")
+    consumer=$(awk '$1 == "consumer" { print $2 }' "$WOUT/load_pcs.txt")
+    if [ "$(echo "$producer" | wc -w)" -ne 1 ] ||
+       [ "$(echo "$consumer" | wc -w)" -ne 1 ]; then
+        echo "load_pcs.txt: expected one producer and one consumer" >&2
+        exit 1
+    fi
+    producer=$((producer))
+    consumer=$((consumer))
+    if [ "$consumer" -le "$producer" ]; then
+        echo "the consumer does not follow the producer" >&2
+        exit 1
+    fi
+    local p c4 c
+    p=$(printf '0x%x' "$producer")
+    c=$(printf '0x%x' "$consumer")
+    c4=$(printf '0x%x' $((consumer + 4)))
+
+    local trace=ExecEnable,ExecUser,ExecFaulting,ExecResult,ExecEffAddr,FmtTicksOff
+    local on=(-P 'system.cpu[0].enableLVP=True'
+              -P 'system.cpu[0].lvpSpecAddr=True')
+    run_gem5 BASE "$trace"
+    run_gem5 FULL "$trace" "${on[@]}" \
+        -P "system.cpu[0].lvpSpecPcBegin=$p" \
+        -P "system.cpu[0].lvpSpecPcEnd=$c4"
+    run_gem5 NO_PRODUCER "$trace" "${on[@]}" \
+        -P "system.cpu[0].lvpSpecPcBegin=$c" \
+        -P "system.cpu[0].lvpSpecPcEnd=$c4"
+    run_gem5 NO_CONSUMER "$trace" "${on[@]}" \
+        -P "system.cpu[0].lvpSpecPcBegin=$p" \
+        -P "system.cpu[0].lvpSpecPcEnd=$c"
+
+    python3 -I "$CHECKER" "$WOUT" pcwindow
+}
+
+# Each configuration here must be refused by a fatal in the constructors
+# (the messages are in check_lvp_stageb.py).  gem5 stops before it runs the
+# program, so none of the files of a completed run are written.
+run_invalid_config()
+{
+    DEFS=(-DLVP_FAULT)
+    CONSUMERS=1
+    LINKS=1
+    WORKLOAD=invalid-config
+    WOUT=$OUT/invalid-config
+    BIN=$WOUT/ldld
+    WIN_BEGIN=
+    WIN_END=
+    mkdir -p "$WOUT"
+    local n
+    for n in spec_without_lvp spec_without_early_issue window_without_spec \
+             window_begin_after_end window_begin_equals_end threshold_zero \
+             threshold_four table_not_power_of_two table_zero; do
+        rm -rf "${WOUT:?}/$n"
+        rm -f "${WOUT:?}/$n.out" "${WOUT:?}/$n.rc"
+    done
+    check_asm
+
+    local cpu='system.cpu[0]'
+    local lvp=(-P "$cpu.enableLVP=True")
+    local spec=(-P "$cpu.enableLVP=True" -P "$cpu.lvpSpecAddr=True")
+    run_gem5 spec_without_lvp LVP -P "$cpu.lvpSpecAddr=True"
+    run_gem5 spec_without_early_issue LVP "${spec[@]}" \
+        -P "$cpu.executeAllowEarlyMemoryIssue=False"
+    run_gem5 window_without_spec LVP "${lvp[@]}" \
+        -P "$cpu.lvpSpecPcBegin=0x10100" -P "$cpu.lvpSpecPcEnd=0x10200"
+    run_gem5 window_begin_after_end LVP "${spec[@]}" \
+        -P "$cpu.lvpSpecPcBegin=0x10200" -P "$cpu.lvpSpecPcEnd=0x10100"
+    run_gem5 window_begin_equals_end LVP "${spec[@]}" \
+        -P "$cpu.lvpSpecPcBegin=0x10100" -P "$cpu.lvpSpecPcEnd=0x10100"
+    run_gem5 threshold_zero LVP "${lvp[@]}" -P "$cpu.lvpConfThreshold=0"
+    run_gem5 threshold_four LVP "${lvp[@]}" -P "$cpu.lvpConfThreshold=4"
+    run_gem5 table_not_power_of_two LVP "${lvp[@]}" \
+        -P "$cpu.lvpTableEntries=1000"
+    run_gem5 table_zero LVP "${lvp[@]}" -P "$cpu.lvpTableEntries=0"
+
+    python3 -I "$CHECKER" "$WOUT" invalid-config
+}
+
 case ${1:-} in
 threshold)
     [ $# -eq 1 ] || usage
     run_threshold
+    ;;
+pcwindow)
+    [ $# -eq 1 ] || usage
+    run_pcwindow
+    ;;
+invalid-config)
+    [ $# -eq 1 ] || usage
+    run_invalid_config
     ;;
 check-asm)
     [ $# -le 2 ] || usage
