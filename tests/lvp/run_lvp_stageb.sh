@@ -9,6 +9,8 @@
 #   run_lvp_stageb.sh threshold             the confidence-threshold test
 #   run_lvp_stageb.sh pcwindow              the PC-window test
 #   run_lvp_stageb.sh invalid-config        the invalid-configuration test
+#   run_lvp_stageb.sh confidence            the confidence-counter test
+#   run_lvp_stageb.sh alias                 the untagged-table (aliasing) test
 #
 # run starts run-one in a separate process for each workload, so that a
 # failure anywhere in one workload (the build, the assembly check, ...)
@@ -45,6 +47,16 @@
 # OUT/invalid-config, is started with each configuration that the
 # constructors must refuse, and the checker requires the exit status and the
 # fatal message.  Neither pcwindow nor invalid-config is part of all.
+#
+# confidence and alias are the two predictor-policy tests (not part of all);
+# their program is lvp_policy.c, built into OUT/confidence and OUT/alias.
+# Both are run with LVP off (A), with prediction only (B), and with
+# prediction only and the LVP debug trace (CL), whose lookup and training
+# lines the checker replays against a model of the table.  confidence: one
+# load is trained to saturation, sees one value change and is trained again
+# (a mismatch must lower the 2-bit counter by one, not reset it).  alias: two
+# loads 2048 bytes apart share one table entry (an untagged table must let
+# one train the entry the other reads).
 #
 # OUT (default /tmp/lvp-stage-b) is where everything is written, in a
 # subdirectory for each workload.  gem5 must already be built
@@ -608,6 +620,95 @@ run_invalid_config()
     python3 -I "$CHECKER" "$WOUT" invalid-config
 }
 
+
+# The policy programs (lvp_policy.c).  DEFS gets the program selector.
+select_policy()
+{
+    case $1 in
+    confidence) DEFS=(-DPOLICY_CONF) ;;
+    alias) DEFS=(-DPOLICY_ALIAS) ;;
+    *) echo "unknown policy test: $1" >&2; exit 2 ;;
+    esac
+    WORKLOAD=$1
+    WOUT=$OUT/$1
+    BIN=$WOUT/policy
+    mkdir -p "$WOUT"
+    rm -f "${WOUT:?}/policy" "${WOUT:?}/policy.S" "${WOUT:?}/policy_pcs.txt"
+    local n
+    for n in A B CL; do
+        rm -rf "${WOUT:?}/$n"
+        rm -f "${WOUT:?}/$n.out" "${WOUT:?}/$n.rc"
+    done
+}
+
+# Build the policy program and check that its loads are exactly the ones the
+# test is about: one load, in read_n (confidence), or two, ld_a and ld_b
+# 2048 bytes apart, at the same table index (alias).  Writes policy_pcs.txt.
+check_policy_asm()
+{
+    "$CC" -O1 -static -nostdlib -ffreestanding -march=rv64g -mabi=lp64d \
+        -Wl,-n -Wl,--no-relax-gp -Wl,-e,_start "${DEFS[@]}" \
+        -o "$BIN" "$HERE/lvp_policy.c"
+    "$OBJDUMP" -d --no-show-raw-insn "$BIN" > "$WOUT/policy.S"
+    "$NM" -S --defined-only "$BIN" > "$WOUT/policy.nm"
+
+    python3 -I - "$WOUT" "$WORKLOAD" <<'PY'
+import re, sys
+wout, mode = sys.argv[1], sys.argv[2]
+LOAD = re.compile(r"^\s*([0-9a-f]+):\s+(l[bhwd]u?|fl[wd]|lr\.[wd][.a-z]*)\s")
+loads = []
+for line in open(wout + "/policy.S"):
+    m = LOAD.match(line)
+    if m:
+        loads.append((int(m.group(1), 16), m.group(2)))
+syms = {}
+for line in open(wout + "/policy.nm"):
+    f = line.split()
+    if len(f) == 4:
+        syms[f[3]] = (int(f[0], 16), int(f[1], 16))
+print("loads in the program: %s" % ", ".join("%x %s" % l for l in loads))
+fail = []
+with open(wout + "/policy_pcs.txt", "w") as out:
+    if mode == "confidence":
+        lo, size = syms["read_n"]
+        if len(loads) != 1 or not lo <= loads[0][0] < lo + size \
+                or loads[0][1] != "ld":
+            fail.append("expected exactly one ld, in read_n")
+        else:
+            out.write("load 0x%x\n" % loads[0][0])
+    else:
+        a, _ = syms["ld_a"]
+        b, _ = syms["ld_b"]
+        if sorted(l[0] for l in loads) != sorted([a, b]):
+            fail.append("expected exactly the loads of ld_a and ld_b")
+        if a == b or (b - a) % 2048 or ((a >> 1) & 1023) != ((b >> 1) & 1023):
+            fail.append("ld_a and ld_b do not map to the same index of a "
+                        "1024-entry table")
+        out.write("ld_a 0x%x\nld_b 0x%x\n" % (a, b))
+        print("ld_a %#x ld_b %#x: index (pc >> 1) & 1023 = %d and %d"
+              % (a, b, (a >> 1) & 1023, (b >> 1) & 1023))
+if fail:
+    print("FAIL: " + "; ".join(fail))
+    sys.exit(1)
+print("PASS: the loads of the %s program are as intended" % mode)
+PY
+}
+
+run_policy()
+{
+    select_policy "$1"
+    check_policy_asm
+
+    local trace=ExecEnable,ExecUser,ExecFaulting,ExecResult,ExecEffAddr,FmtTicksOff
+    local on=(-P 'system.cpu[0].enableLVP=True'
+              -P 'system.cpu[0].lvpSpecAddr=False')
+    run_gem5 A "$trace"
+    run_gem5 B "$trace" "${on[@]}"
+    run_gem5 CL LVP "${on[@]}"
+
+    python3 -I "$CHECKER" "$WOUT" "$1"
+}
+
 case ${1:-} in
 threshold)
     [ $# -eq 1 ] || usage
@@ -620,6 +721,10 @@ pcwindow)
 invalid-config)
     [ $# -eq 1 ] || usage
     run_invalid_config
+    ;;
+confidence | alias)
+    [ $# -eq 1 ] || usage
+    run_policy "$1"
     ;;
 check-asm)
     [ $# -le 2 ] || usage

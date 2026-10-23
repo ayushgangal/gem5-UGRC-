@@ -186,6 +186,34 @@ enum class LVPConsumerState : uint8_t
     Done
 };
 
+/** Lifecycle of a load looked up in the ASTRA shadow predictor.  The
+ *  terminal outcome is classified exactly once, where the instruction
+ *  leaves Execute's in-flight queue, see Execute::astraRetire(). */
+enum class ASTRAState : uint8_t
+{
+    None,       /* Not looked up (not an eligible load, or ASTRA is off) */
+    Looked,     /* Looked up, terminal outcome not yet classified */
+    Done        /* Classified */
+};
+
+/** State of a load in the diagnostic V-ASTRA probe (see vastra.hh) */
+/** Consumer role of V-ASTRA forwarding (Design B): the request of this load
+ *  was built from a published (validated) producer value */
+enum class VAFwdConsumer : uint8_t
+{
+    None,
+    Accepted,   /* the request is in the LSQ and used the value */
+    Done        /* outcome counted */
+};
+
+enum class VAstraState : uint8_t
+{
+    None,       /* Not decided (no ASTRA prediction, or the probe is off) */
+    Rejected,   /* Decided: no candidate */
+    Candidate,  /* Decided: a copy of the V$ entry was taken */
+    Done        /* A candidate that has had its terminal outcome */
+};
+
 /** Dynamic instruction for Minor.
  *  MinorDynInst implements the BubbleIF interface
  *  Has two separate notions of sequence number for pre/post-micro-op
@@ -280,6 +308,61 @@ class MinorDynInst : public RefCounted
     LVPValidation lvpValidation = LVPValidation::None;
     /** Consumer role: this inst's request used a predicted source value */
     LVPConsumerState lvpConsState = LVPConsumerState::None;
+
+    /** ASTRA shadow predictor (see astra.hh, only used if enableAstra) */
+    ASTRAState astraState = ASTRAState::None;
+    /** The base address ASTRA predicted for this load at issue */
+    Addr astraPredBase = 0;
+    /** The base register's value when the effective address was computed */
+    RegVal astraActualBase = 0;
+    /** astraActualBase was captured (and not under an LVP prediction) */
+    bool astraBaseValid = false;
+
+    /** The address and size of this memory operation once its request has
+     *  been pushed into the LSQ (set by LSQ::pushRequest).  Used by the
+     *  diagnostic V-ASTRA probe to find the address of an older store */
+    bool memAddrKnown = false;
+    Addr memVaddr = 0;
+    unsigned memSize = 0;
+
+    /** Diagnostic V-ASTRA probe (see vastra.hh, only used if
+     *  enableVAstraDiag) */
+    VAstraState vaState = VAstraState::None;
+    /** The effective address predicted from the predicted base */
+    Addr vaPredEa = 0;
+    /** A copy of the V$ entry for that address, taken at the decision */
+    bool vaTagHit = false;
+    uint16_t vaValid = 0;
+    uint8_t vaData[16] = {};
+    /** Stage 2b bypass: the load's response was synthesised from the V$
+     *  (no memory request was made); it is not an observation of memory */
+    bool vaBypassed = false;
+    /** The bypass point was reached and the load was classified as going to
+     *  memory (fallback or abandoned): the LSQ can call the bypass hook
+     *  again if the memory send fails and is retried, and the load must be
+     *  counted, and decided, once */
+    bool vaFellBack = false;
+    /** The destination registers of this memory reference were marked
+     *  unpredictable at issue (scoreboard, extraAssumedLat == 0) */
+    bool sbUnpredictable = false;
+    /** Design B producer role: the register value this load writes, from
+     *  the V$ bytes at the final bypass success */
+    RegVal vaRegValue = 0;
+    bool vaRegValid = false;
+    /** Design B consumer role (enableVAstraForwarding) */
+    InstSeqNum vaFwdProducer = 0;
+    RegVal vaFwdSrcVal = 0;
+    RegId vaFwdSrcReg;
+    /** Set only around the call that builds the request: the operand
+     *  vaFwdSrcReg reads vaFwdSrcVal.  See ExecContext::getRegOperand */
+    bool vaFwdActive = false;
+    VAFwdConsumer vaFwdState = VAFwdConsumer::None;
+    /** The producer's record was found pending or failed (counted once) */
+    uint8_t vaFwdWaited = 0;    /* bit 0 pending, bit 1 failed */
+    /** ... and that mark was released early by V-ASTRA (see
+     *  Scoreboard::releaseUnpredictable): the commit-time clear must not
+     *  decrement again */
+    bool vaScoreReleased = false;
 
     /** Extra delay at the end of the pipeline */
     Cycles extraCommitDelay{0};

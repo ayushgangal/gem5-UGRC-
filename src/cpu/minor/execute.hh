@@ -45,12 +45,14 @@
 #ifndef __CPU_MINOR_EXECUTE_HH__
 #define __CPU_MINOR_EXECUTE_HH__
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <vector>
 
 #include "base/named.hh"
 #include "base/types.hh"
+#include "cpu/minor/astra.hh"
 #include "cpu/minor/buffers.hh"
 #include "cpu/minor/cpu.hh"
 #include "cpu/minor/func_unit.hh"
@@ -58,6 +60,8 @@
 #include "cpu/minor/lvp.hh"
 #include "cpu/minor/pipe_data.hh"
 #include "cpu/minor/scoreboard.hh"
+#include "cpu/minor/vastra.hh"
+#include "cpu/minor/vcache.hh"
 
 namespace gem5
 {
@@ -128,6 +132,50 @@ class Execute : public Named
      *  [lvpSpecPcBegin, lvpSpecPcEnd).  Both 0 means unrestricted */
     Addr lvpSpecPcBegin;
     Addr lvpSpecPcEnd;
+
+    /** ASTRA base address predictor in shadow mode.  The predictor only
+     *  exists (and its stats are only registered) when this is true. */
+    bool enableAstra;
+    std::unique_ptr<AstraPredictor> astra;
+
+    /** Shadow value cache: a model kept up to date by retiring loads and
+     *  stores, never used.  Only exists (and its statistics are only
+     *  registered) when this is true. */
+    bool enableVCache;
+    std::unique_ptr<VCache> vcache;
+
+    /** Diagnostic V-ASTRA probe (needs ASTRA and the V$): see vastra.hh.
+     *  vastraStores is, for each thread, the stores and atomics that have
+     *  been issued and have not left the in flight queue, oldest first. */
+    bool enableVAstraDiag;
+    bool enableVAstraVerify;
+    bool enableVAstraBypass;
+    bool vastraSkipSyscallFlush;
+    bool vastraScoreboardRelease;
+    bool vastraForwarding;
+
+    /** Design B: per dynamic producer (execSeqNum), the state of its
+     *  V-ASTRA value: created at the decision of a candidate whose result
+     *  can be forwarded, Validated at the final bypass success, Failed at
+     *  any other end of the candidate, erased when the producer leaves the
+     *  in-flight queue */
+    struct VAFwdEntry
+    {
+        enum State
+        {
+            Pending,
+            Validated,
+            Failed
+        } state = Pending;
+        RegId destReg;          /* flattened */
+        RegVal value = 0;
+        InstSeqNum stream = 0;
+    };
+    std::vector<std::map<InstSeqNum, VAFwdEntry>> vaFwdMap;
+    bool vastraSkipStoreScan;
+    std::unique_ptr<VAstraDiag> vastra;
+    std::vector<std::deque<MinorDynInstPtr>> vastraStores;
+
     std::unique_ptr<LastValuePredictor> lvp;
 
     /** A confident prediction that a younger load may use as its base
@@ -339,6 +387,84 @@ class Execute : public Named
     void lvpCheckOccupancy() const;
     /** @} */
 
+    /** @name ASTRA shadow predictor (only used if enableAstra)
+     *  @{ */
+    /** Is this an ordinary load whose first source is an integer base
+     *  register? */
+    bool astraEligible(const MinorDynInstPtr &inst) const;
+
+    /** Called once for each instruction issued, in issue order: look up
+     *  the base address prediction of an eligible load.  This happens
+     *  before the base register is read */
+    void astraOnIssue(const MinorDynInstPtr &inst);
+
+    /** Called just before an eligible load's effective address is
+     *  computed, when its base register can be read: remember the real
+     *  base address.  Not captured while the load runs on an LVP
+     *  predicted source, which is not the real value */
+    void astraCaptureBase(const MinorDynInstPtr &inst, ThreadContext *thread);
+
+    /** Classify the terminal outcome of the instruction that is about to
+     *  be removed from the in-flight queue and train the predictor with
+     *  the loads that retired.  The flags are the commit loop's own flags
+     *  for this iteration's instruction */
+    void astraRetire(const MinorDynInstPtr &inst, bool discarded,
+        bool faulted, bool committed);
+    /** @} */
+
+    /** @name Shadow value cache (only used if enableVCache)
+     *  @{ */
+    /** A memory operation that completed without a fault and was not
+     *  discarded is retiring (called from handleMemResponse): maintain the
+     *  shadow V$ from the request and packet.  Changes nothing else. */
+    void vcacheRetire(const MinorDynInstPtr &inst,
+        LSQ::LSQRequestPtr response);
+    /** @} */
+
+    /** @name Diagnostic V-ASTRA probe (only used if enableVAstraDiag)
+     *  @{ */
+    /** A store or atomic was issued: remember it as in flight */
+    void vastraOnIssue(const MinorDynInstPtr &inst);
+
+    /** Design B */
+    /** Can the producer's result be forwarded: an ordinary integer load
+     *  (lb lbu lh lhu lw lwu ld) writing a register other than zero */
+    bool vastraFwdProducer(const MinorDynInstPtr &inst) const;
+    /** The register value the load writes, from its raw bytes */
+    bool vastraRegValue(const MinorDynInstPtr &inst, const uint8_t *bytes,
+                        unsigned size, RegVal &value) const;
+    void vastraFwdFail(const MinorDynInstPtr &inst, const char *why);
+    /** May fu_inst (the front of the memory FU and of inFUMemInsts) build
+     *  its request now from its producer's published value?  Sets the
+     *  consumer's override fields on success. */
+    bool vastraFwdAdmissible(const ExecuteThreadInfo &ex_info,
+        const MinorDynInstPtr &fu_inst,
+        const MinorDynInstPtr &head_mem_ref_inst);
+    /** A committed system call may have changed user memory without going
+     *  through the LSQ: drop the whole V$ */
+    void vcacheSyscallFlush(const MinorDynInstPtr &inst);
+    /** Older stores in flight that overlap [ea, ea + size) (conflict) or
+     *  have no address yet (unknown) */
+    void vastraScanStores(const MinorDynInstPtr &inst, Addr ea,
+                          unsigned size, bool &conflict, bool &unknown);
+
+    /** The load's real base register is first available (called just after
+     *  astraCaptureBase): decide whether its ASTRA prediction is a candidate
+     *  and, if so, copy the V$ entry for the predicted effective address */
+    void vastraDecide(const MinorDynInstPtr &inst);
+
+    /** The instruction is about to leave the in flight queue: forget a
+     *  store, and give a candidate that was discarded or faulted its
+     *  terminal outcome */
+    void vastraPop(const MinorDynInstPtr &inst, bool discarded,
+        bool faulted);
+
+    /** The load retires without a fault: compare its candidate with the raw
+     *  bytes it read.  supported says the V$ model supports the access. */
+    void vastraValidate(const MinorDynInstPtr &inst, bool supported,
+        Addr vaddr, unsigned size, const uint8_t *data);
+    /** @} */
+
     /** Act on an interrupt.  Returns true if an interrupt was actually
      *  signalled and invoked */
     bool takeInterrupt(ThreadID thread_id, BranchData &branch);
@@ -423,6 +549,15 @@ class Execute : public Named
     /** Returns true if the given instruction is at the head of the
      *  inFlightInsts instruction queue */
     bool instIsHeadInst(MinorDynInstPtr inst);
+
+    /** Stage 2b bypass, called by the LSQ for a load that is about to be
+     *  sent to the memory system (translated, at the front of the requests
+     *  queue, no store in the transfers queue, no store buffer overlap).
+     *  If every check passes, copies the V$ bytes into the request's
+     *  packet, turns it into a response and returns true: the LSQ then
+     *  completes the request without a memory access.  False: the
+     *  request goes to memory as usual.  single: not a split request. */
+    bool vastraTryBypass(LSQ::LSQRequestPtr request, bool single);
 
     /** Pass on input/buffer data to the output if you can */
     void evaluate();

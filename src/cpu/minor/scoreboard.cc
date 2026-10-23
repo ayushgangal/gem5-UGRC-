@@ -112,8 +112,12 @@ Scoreboard::markupInstDests(MinorDynInstPtr inst, Cycles retire_time,
         Index index;
 
         if (findIndex(reg, index)) {
-            if (mark_unpredictable)
+            if (mark_unpredictable) {
                 numUnpredictableResults[index]++;
+                DPRINTF(MinorScoreboard, "Unpredictable mark inst: %s "
+                    "regIndex: %d count: %d\n", *inst, index,
+                    numUnpredictableResults[index]);
+            }
 
             inst->flatDestRegIdx[dest_index] = reg;
 
@@ -183,8 +187,12 @@ Scoreboard::clearInstDests(MinorDynInstPtr inst, bool clear_unpredictable)
         Index index;
 
         if (findIndex(reg, index)) {
-            if (clear_unpredictable && numUnpredictableResults[index] != 0)
+            if (clear_unpredictable && numUnpredictableResults[index] != 0) {
                 numUnpredictableResults[index] --;
+                DPRINTF(MinorScoreboard, "Unpredictable clear inst: %s "
+                    "regIndex: %d count: %d\n", *inst, index,
+                    numUnpredictableResults[index]);
+            }
 
             numResults[index] --;
 
@@ -199,6 +207,45 @@ Scoreboard::clearInstDests(MinorDynInstPtr inst, bool clear_unpredictable)
                 *inst, index, numResults[index]);
         }
     }
+}
+
+unsigned
+Scoreboard::releaseUnpredictable(MinorDynInstPtr inst)
+{
+    unsigned released = 0;
+
+    if (inst->isFault())
+        return released;
+
+    StaticInstPtr staticInst = inst->staticInst;
+    unsigned int num_dests = staticInst->numDestRegs();
+
+    for (unsigned int dest_index = 0; dest_index < num_dests; dest_index++) {
+        const RegId &reg = inst->flatDestRegIdx[dest_index];
+        Index index;
+
+        if (findIndex(reg, index) && numUnpredictableResults[index] != 0) {
+            numUnpredictableResults[index]--;
+            released++;
+
+            DPRINTF(MinorScoreboard, "Unpredictable release inst: %s "
+                "regIndex: %d count: %d\n", *inst, index,
+                numUnpredictableResults[index]);
+        }
+    }
+
+    return released;
+}
+
+unsigned
+Scoreboard::totalUnpredictable() const
+{
+    unsigned total = 0;
+
+    for (unsigned i = 0; i < numRegs; i++)
+        total += numUnpredictableResults[i];
+
+    return total;
 }
 
 bool

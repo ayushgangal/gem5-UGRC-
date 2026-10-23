@@ -6,6 +6,16 @@
 > every result, and every mistake or surprise along the way (each with a small
 > example).
 
+> **Status (2026-10-19): the predictor was changed to follow the paper's LVP
+> table.** The table is now **untagged** and the 2-bit confidence counter is
+> **decremented on a mismatch** instead of being reset. Section 15 describes
+> the current behaviour, the two tests added for it and the remaining
+> differences from the paper; section 3.2 and the parameter notes were updated.
+> The step-by-step history (sections 6 to 10) and the counters in section 9
+> describe the **earlier prototype** (full-PC tag, valid bit, reset to 0 on a
+> mismatch) as it was at the time; they are kept as a record and are not the
+> current numbers (the current ones are in section 15.6).
+
 ## Contents
 
 | | |
@@ -24,6 +34,7 @@
 | [12. Environment](#12-environment-notes) | build and tooling |
 | [13. Limits and gaps](#13-limits-and-untested-areas) | what is not covered |
 | [14. Glossary](#14-glossary) | terms used |
+| [15. Paper-aligned predictor](#15-paper-aligned-predictor-current-behaviour) | current table and counter, the new tests, remaining differences |
 
 ---
 
@@ -131,11 +142,15 @@ Code lives in `src/cpu/minor/`.
 
 ### 3.2 Components
 
-- **Predictor** (`LastValuePredictor`): direct-mapped, indexed by `pc >> 1`,
-  full-PC tag, last value, 2-bit confidence counter. Training only on loads
-  that commit: match → +1 (max 3); different value → replace value, confidence
-  0; first sight → install at confidence 0. A lookup predicts only if the tag
-  matches and `confidence >= lvpConfThreshold`.
+- **Predictor** (`LastValuePredictor`, current behaviour; details in section
+  15): direct-mapped table of `lvpTableEntries` entries (default 1,024),
+  indexed by `(pc >> 1) & (entries - 1)`, **untagged**, each entry a last value
+  and a 2-bit confidence counter (no tag, no valid bit). Training only on loads
+  that commit: the stored value is compared with the observed one; a match
+  raises the counter (max 3), a mismatch lowers it (min 0), and the observed
+  value is stored. A lookup predicts only if `confidence >= lvpConfThreshold`
+  (default 3). *(The earlier prototype had a full-PC tag and valid bit, reset
+  the counter to 0 on a mismatch and installed at confidence 0 on first sight.)*
 - **Per-thread speculative map** (`lvpSpecMap`): keyed by flattened `RegId`
   (not a bare integer-register index), each entry holds producer sequence
   number, producer PC and predicted value.
@@ -232,8 +247,8 @@ In `BaseMinorCPU.py`. **Always run with `enableIdling=False`** (section 10.2).
 | `enableLVP` | `False` | Predictor on (prediction only) |
 | `lvpSpecAddr` | `False` | Consumers use predictions. Requires `enableLVP` and `executeAllowEarlyMemoryIssue` |
 | `lvpSpecPcBegin`, `lvpSpecPcEnd` | `0`, `0` | Half-open window `[begin, end)`: producer **and** consumer PC must be inside. Both 0 = unrestricted. Requires `lvpSpecAddr` and `begin < end` |
-| `lvpTableEntries` | `1024` | Non-zero power of two (checked when `enableLVP`) |
-| `lvpConfThreshold` | `3` | 1 to 3 (checked when `enableLVP`) |
+| `lvpTableEntries` | `1024` | Non-zero power of two (checked when `enableLVP`). 1,024 is the paper's size; other sizes are an experimental control. Fewer entries means more aliasing |
+| `lvpConfThreshold` | `3` | 1 to 3 (checked when `enableLVP`). 3 (saturated) is the paper-aligned default; 1 and 2 are experimental overrides |
 
 Override syntax: `-P 'system.cpu[0].enableLVP=True'` (the CPU is a vector).
 
@@ -568,6 +583,14 @@ saved real results of the earlier workloads to prove no regression.
 ## 9. Results
 
 "N checks" is the checker's PASS count with 0 FAIL.
+
+> **The counters in 9.1 to 9.8 were measured with the earlier tagged,
+> reset-on-mismatch table** (and, for the cycle figures, with the earlier
+> `se.py` setup). They are kept as history. With the paper-aligned table the
+> confident, correct and incorrect counts of the phase, fan-out, fault and
+> chain workloads are higher; the current figures are in section 15.6. No
+> checker assertion was changed for this: the original checks do not depend on
+> the exact counts.
 
 ### 9.1 Stable (Stage B, repeated after Stage C)
 
@@ -985,10 +1008,13 @@ tests/lvp/run_lvp_stageb.sh run [WORKLOAD]         # check-asm, then A, B, C, CL
 tests/lvp/run_lvp_stageb.sh threshold              # confidence-threshold test
 tests/lvp/run_lvp_stageb.sh pcwindow               # PC-window test
 tests/lvp/run_lvp_stageb.sh invalid-config         # invalid-configuration test
+tests/lvp/run_lvp_stageb.sh confidence             # confidence-counter test (section 15.4)
+tests/lvp/run_lvp_stageb.sh alias                  # untagged-table (aliasing) test (section 15.4)
 ```
 
 `WORKLOAD` is `stable`, `phase`, `fanout`, `fault`, `chain` or `all` (the
-default). The three configuration tests are not part of `all`. Each workload
+default). The configuration tests and the two policy tests (`confidence`,
+`alias`) are not part of `all`. Each workload
 writes under `$OUT/<name>`, and `run` starts a separate process per workload so
 a failure stops that workload before any simulation while all are attempted.
 
@@ -998,7 +1024,11 @@ The checker alone:
 python3 -I tests/lvp/check_lvp_stageb.py OUT/<name> <mode>
 ```
 
-`<mode>` is `stable|phase|fanout|fault|chain|threshold|pcwindow|invalid-config`.
+`<mode>` is `stable|phase|fanout|fault|chain|threshold|pcwindow|invalid-config|confidence|alias`.
+
+The runner starts gem5 with `configs/deprecated/example/se.py`. To run the
+suites on the research baseline `configs/research/vp_baseline.py` instead, see
+section 15.5.
 
 Notes:
 - The `Branch` logs of phase, fanout, fault and chain are large (160 to 330 MB
@@ -1046,8 +1076,9 @@ L1's prediction).
   asserted to be 0; a scheduled-reset wrapper was planned but not written.
 - An erroring memory response (not reachable in SE mode), and `update()`
   retiring more than one older history entry.
-- Other block sizes, random transition patterns, table aliasing, other table
-  sizes.
+- Other block sizes, random transition patterns, other table sizes. (Table
+  aliasing is now covered by the `alias` test, section 15.4, but only for one
+  pair of loads.)
 - The safety stops (consumer source check, the `panic_if`s) have never fired in
   a real run; they are source-verified only. The checkers were exercised with
   synthetic logs, not by mutating the C++.
@@ -1073,3 +1104,243 @@ L1's prediction).
 | window | `[lvpSpecPcBegin, lvpSpecPcEnd)` restricting speculation by PC |
 | A/B/C/CL | LVP off / prediction only / speculation / speculation with log |
 | TA, T1–T3 | threshold-test runs (off, thresholds 1 to 3) |
+
+---
+
+## 15. Paper-aligned predictor (current behaviour)
+
+Reference: Ravenel, Perais, Dupont de Dinechin, Pétrot, *Architecting Value
+Prediction around In-Order Execution*, HPCA 2025 (Table II, section IV-E).
+This section describes what the code does **now**. Where the paper is silent
+the text says so.
+
+### 15.1 The table (`lvp.hh`, `lvp.cc`)
+
+- `lvpTableEntries` entries (default **1,024**, a power of two, the paper's
+  size), each holding a 64-bit last value and a 2-bit confidence counter.
+  There is **no PC tag and no valid bit**.
+- Index: `(pc >> 1) & (entries - 1)` (`LastValuePredictor::index`). Two loads
+  alias when their PCs differ only by a multiple of `2 * entries` bytes (2,048
+  bytes for 1,024 entries). **Aliasing loads share the entry's value and its
+  confidence**, as in an untagged table.
+- Confidence: 2 bits, range **0 to 3**.
+- Training (`train`), on every observation of an eligible load: if the stored
+  value equals the observed value the counter is incremented (saturating at
+  3); otherwise it is decremented (saturating at 0). In both cases the observed
+  value is then stored (the **most recently observed value is always kept**).
+  The counter is updated whether or not a prediction was made or used, because
+  an entry below the threshold has to be able to gain confidence.
+- Lookup (`lookup`): a prediction is returned only if `confidence >=
+  lvpConfThreshold`. The default threshold is **3** (saturated), the paper's
+  rule for META ("the confidence counter of the Last Value Predictor is
+  saturated"). Thresholds **1 and 2 are experimental overrides**, not the
+  paper's configuration.
+- Statistics keep their meaning: `lookups` counts eligible lookups,
+  `confidentPredictions` counts lookups that returned a prediction (an
+  *available* prediction, which is then attached to the load at issue),
+  `trainings` counts observations that trained the table, and `correct` /
+  `incorrect` are the outcomes of validating the predictions that were
+  attached. These are different counts and none was redefined.
+
+**Cold start (an implementation policy, not from the paper).** Table II lists
+the fields of an entry but does not give an initial state. Every entry starts
+with **value 0 and confidence 0**. Consequences: a never-trained entry cannot
+be confident at any threshold of 1 or more; but it behaves as if it had last
+seen the value 0, so an observed 0 counts as a match and raises its confidence
+(a load that returns 0 gains confidence from its first observation). This was
+chosen because it needs no extra per-entry state, matching the paper's fields.
+
+The paper's wording is "incremented in the event of a correct prediction and
+decremented in the event of an incorrect prediction". Here "prediction" is read
+as the entry's stored value, compared on every observation; this is an
+interpretation.
+
+### 15.2 When the table is read and trained (unchanged by this work)
+
+- **Lookup** happens when the load is **issued** (`Execute::lvpOnIssue`
+  calls `lookup`), not in the front end as in the paper (META is accessed
+  "2 cycles before the issue stage").
+- **Training** happens when the load's response is handled at the head of the
+  in-flight queue, in `Execute::handleMemResponse` ->
+  `lvpValidateProducer` -> `train`, in the same `commit()` step in which the
+  load commits. Loads that are discarded (wrong stream) or fault never train.
+  So it trains at retirement, in program order, which matches the paper's
+  "Load retire: update META". (An earlier version of this record said the
+  table was trained before commit; that was imprecise.)
+- Because the table is read at issue and trained at retirement, several
+  instances of a load can be looked up before the earlier ones have trained.
+  The paper itself notes update delay (section IV-F).
+- Eligible producers and consumers, the PC window, validation point and
+  recovery are exactly as described in sections 3 and 8.
+
+### 15.3 Debug output added for the tests
+
+Two narrow trace lines under the existing `LVP` debug flag, in `lvp.cc`:
+
+```
+table lookup pc: 0x.. index: N value: 0x.. confidence: C confident: 0|1
+table train pc: 0x.. index: N stored: 0x.. actual: 0x.. confidence: B -> A
+```
+
+They are printed with `DPRINTFR`, so they have no tick or object name; the
+log order is the order the events happened in. Nothing else in the log format
+changed (the existing checkers ignore these lines).
+
+### 15.4 The two policy tests (`lvp_policy.c`)
+
+Both use the freestanding program `lvp_policy.c`, run with LVP off (A),
+prediction only (B) and prediction only with the `LVP` trace (CL); address
+speculation is off. The checker (`check_lvp_stageb.py`, modes `confidence`
+and `alias`) first checks the checksum, that the committed traces of A and B
+are byte-identical, and the `config.ini` settings, then **replays every logged
+lookup and training on a reference model of the table**, requires 0
+disagreements, and cross-checks the log against the `cpu.lvp.*` statistics
+(`lookups`, `confidentPredictions`, `trainings`, `correct + incorrect` =
+validated lines) and the lifecycle identity. The runner first checks the
+disassembly: only the intended loads exist.
+
+**`confidence`** (`POLICY_CONF`): one `ld` in `read_n()` reads a cell holding
+1000 for 48 reads, then 2000 for 48, then 1000 for 48, with a register-only
+delay after each read so that every earlier training is done before the next
+lookup. It requires that the training at which a saturated entry sees 2000
+takes confidence **3 -> 2 (not 0)**, that the next matching training takes it
+2 -> 3, that confident predictions of the new value resume after **1**
+training (a counter reset on a mismatch would need 3), that a lookup saw
+confidence 2 and was not confident, and that at least one confident prediction
+(made before the change was seen) validated incorrect.
+
+**`alias`** (`POLICY_ALIAS`): `ld_a` at a 4,096-byte boundary and `ld_b` 2,048
+bytes after it (`pc` and `pc + 2048`), each a single `ld`. `ld_a` loads 111
+twelve times, then `ld_b` loads 222 once, then `ld_a` loads 111 twelve times,
+with delays between phases. The test checks the alias with the index formula
+from the PCs in the disassembly (not from simulator output), and requires that
+`ld_b`'s first lookup is **confident (confidence 3) with `ld_a`'s value 111**,
+that this prediction is validated against 222 (incorrect), that `ld_b`'s
+training sees `ld_a`'s entry (stored 111, 3 -> 2), and that `ld_a`'s next
+lookup sees value 222, confidence 2, not confident.
+
+**How they tell the new behaviour from the old.** The checker also replays the
+same log on models of the previous behaviour (reset on mismatch; full-PC tag
+with valid bit) and requires that the log **disagrees** with them: the resume
+needs 1 training instead of 3, and the tagged model disagrees with the log in
+10 events of the alias run. This was checked on real logs of the current
+binary. The tests were **not** run against a binary of the old predictor (it
+no longer exists, and it did not print the table trace lines), so the
+distinction rests on those models.
+
+**Which tests need real mispredictions.** `phase`, `fanout`, `fault` and
+`chain` require recovery to happen: they check the redirect counts, the event
+order, the squash of the consumers and the Fetch2 hook counts against the
+log, so recovery has to occur and be observed (current counts: 255, 255, 32 and
+1 redirects). `stable` asserts the opposite: no wrong prediction and no
+recovery. `threshold`, `pcwindow` and `invalid-config` are configuration
+tests; the first two run the fault program, which contains mispredictions.
+`confidence` and `alias` need at least one incorrect prediction each (no
+address speculation, so no recovery).
+
+### 15.5 Running them
+
+The runner commands are the ones in section 11. These were verified:
+
+```
+OUT=<dir> tests/lvp/run_lvp_stageb.sh confidence
+OUT=<dir> tests/lvp/run_lvp_stageb.sh alias
+```
+
+as the repository runner invokes them (with `se.py`): 57 and 55 checks, all
+passing. The whole suite (stable, phase, fanout, fault, chain, threshold,
+pcwindow, invalid-config, confidence, alias) was also run on the research
+baseline `configs/research/vp_baseline.py` through a **temporary copy of the
+runner** kept outside the repository (it is not part of the tests): the copy
+differs from `run_lvp_stageb.sh` only in `ROOT` and in the gem5 command line,
+which is `"$CFG" --cmd="$BIN" "$@"`, and `CFG` is a small wrapper script that
+removes the runner's `-P system.cpu[0].NAME=VALUE` arguments from `sys.argv`,
+runs `vp_baseline.py` unchanged with `runpy`, and applies them to the CPU just
+before `m5.instantiate()`. Results and the wrapper are in
+`~/gem5-validation-2026-10-19/` (`harness/`, `suite_*.log`,
+`suite_table.txt`). Nothing outside `tests/lvp/` was changed for this.
+
+Cycle counts depend on the length of the path of the program (the stack is
+laid out differently): the same fault program gave 814,593 and 816,767 cycles
+in two output directories. Compare cycles only within one run directory.
+
+### 15.6 Current results (research baseline, 10 suites, all passing)
+
+Paper-aligned table, `vp_baseline.py` (SingleThreaded, queue limits 16),
+`lvpConfThreshold=3`, 1,024 entries. Statistics are those of prediction only
+(B) and speculation (C).
+
+| Workload | Checksum | Instructions | Confident | Correct | Incorrect | Spec. loads issued / committed / squashed | Recovery redirects |
+|---|---|---|---|---|---|---|---|
+| stable | 114688 | 163,971 | 32,761 | 32,760 | 0 | 11,041 / 11,041 / 0 | 0 |
+| phase | 147456 | 295,047 | 32,721 | 31,740 | 510 | 10,756 / 10,501 / 255 | 255 |
+| fanout | 246290604769280 | 360,712 | 49,100 | 47,610 | 765 | 18,844 / 18,376 / 468 | 255 |
+| chain | 2848 | 527,486 | 934 | 792 | 126 | 349 / 348 / 1 | 1 |
+| fault | 2848 | 527,705 | 643 | 444 | 126 | 216 / 184 / 32 | 32 |
+
+Threshold test (fault program, prediction only, confident predictions at
+thresholds 1, 2, 3): 704, 702, 574. The lifecycle identity (confident +
+carry-in = correct + incorrect + faulted + squashed + in flight) holds in every
+run, with nothing in flight or carried in. `confidence`: 144 lookups, 138
+confident, 136 correct, 2 incorrect. `alias`: 25 lookups, 18 confident, 17
+correct, 1 incorrect. Compared with the earlier table, the stable counters are
+unchanged and the confident and correct counts of phase, fan-out, chain and
+fault are higher; incorrect rose only in fault and chain (64 to 126).
+Speculation did not always save cycles: in the fault program it was slower
+than no LVP, because of the recovery cost.
+
+### 15.7 What is aligned and what is not
+
+**Aligned with the paper's LVP (algorithm):** 1,024 entries; no tag bits; 2-bit
+confidence, incremented on a match and decremented on a mismatch, saturating at
+0 and 3; the last observed value stored; a prediction only at saturated
+confidence (the default); prediction validated by comparing the value when it
+returns.
+
+**Not aligned (MinorCPU adaptations and gaps):**
+
+- Lookup at **issue**, not in the front end ahead of issue.
+- Predictions are used only by **integer load consumers for address
+  generation** (load-to-load); ALU, branch, store and FP/vector dependents
+  never use them (in MinorCPU the ALU dependents already issue early, which
+  is why those would show no gain).
+- A used wrong prediction is recovered by **squash and refetch** after the
+  producer, not by replay from a scoreboard ("replay all younger if needed",
+  8.9% versus 6.1% for a flush in the paper).
+- The consumer is admitted only while its producer is the **oldest in-flight
+  instruction and outstanding in the LSQ**; the paper lets any dependent issue
+  in the shadow of the load.
+- Only the **LVP half of META**: no V-ASTRA / ASTRA, V$, LACT / compressor, no
+  selection between predictors, no minicache.
+- **No store handling** (counting Bloom filter, in-flight invalidation FIFO,
+  store forwarding): a stale prediction simply validates incorrect.
+- **No multiprocessor support**: the paper flushes on a remote write to a
+  predicted in-flight load. Single core, SE mode only.
+- The paper's 2-loads-per-cycle issue/prediction is not modelled.
+- Training and lookup timing differ from a front-end implementation, as in
+  15.2.
+
+### 15.8 The MinorCPU baseline's limits
+
+The research baseline (`configs/research/vp_baseline.py`) is a documented
+MinorCPU **approximation**, not the paper's dedicated CVA6-based model.
+It sets `threadPolicy="SingleThreaded"` and raises `executeMaxAccessesInMemory`
+and `executeLSQTransfersQueueSize` to 16 so that up to 16 demand loads can be
+outstanding (with the default RoundRobin policy, `commit()` is not called while
+the oldest instruction is an outstanding load, so no younger load is sent
+early). Remaining differences, measured or from source:
+
+- Cache latencies are the inherited gem5 defaults and **uncalibrated**: the
+  measured dependent-load latency was about 2 cycles for L1D (paper 4), about 27
+  for L2 (paper 24) and about 125 for memory (paper about 64 cycles; the
+  paper's core clock is not stated). The L1I hit latency (paper 1 cycle) was
+  not measured; it is configured as 2.
+- Two integer ALUs (independent adds give IPC 2.0 although the issue width is
+  4); the in-flight window is about 30 instructions (the sum of the functional
+  units' latencies), not a 32-entry scoreboard; the LSU issues one load per
+  cycle through one memory unit.
+- In SE mode the TLB is bypassed (`RiscvTLB` uses the process page table); the
+  64-entry direct-mapped TLBs of the paper cannot be configured.
+- Workloads are microbenchmarks, not the paper's Linux and SPEC CPU2017
+  SimPoints with a 50M-instruction warm-up. The results in this README are not
+  a reproduction of the paper's evaluation.

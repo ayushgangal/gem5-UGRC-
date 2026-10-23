@@ -1117,7 +1117,16 @@ LSQ::tryToSendToTransfers(LSQRequestPtr request)
                 break;
               case NoAddrRangeCoverage:
                 DPRINTF(MinorMem, "No forwardable data from store buffer\n");
-                /* Fall through to try access */
+                /* A V-ASTRA bypass completes the request from the V$
+                 * without an access (the same queue moves as above) */
+                if (execute.vastraTryBypass(request,
+                        dynamic_cast<SingleDataRequest *>(request) != nullptr))
+                {
+                    DPRINTF(MinorMem, "Load completed by V-ASTRA bypass, no"
+                        " memory access\n");
+                    do_access = false;
+                }
+                /* Otherwise fall through to try access */
                 break;
             }
         }
@@ -1590,6 +1599,12 @@ LSQ::pushRequest(MinorDynInstPtr inst, bool isLoad, uint8_t *data,
     if (inst->inLSQ) {
         return inst->translationFault;
     }
+
+    /* Record where this instruction accesses memory (only read by the
+     * diagnostic V-ASTRA probe) */
+    inst->memAddrKnown = true;
+    inst->memVaddr = addr;
+    inst->memSize = size;
 
     bool needs_burst = transferNeedsBurst(addr, size, lineWidth);
 

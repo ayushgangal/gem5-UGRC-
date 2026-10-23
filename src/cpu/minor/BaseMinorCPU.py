@@ -453,6 +453,79 @@ class BaseMinorCPU(BaseCPU):
     lvpTableEntries = Param.Unsigned(
         1024, "Number of last-value predictor entries (power of two)"
     )
+    enableAstra = Param.Bool(
+        False,
+        "Enable the ASTRA base address predictor in shadow mode (research"
+        " prototype): predictions are recorded and compared with the real"
+        " base address, never used",
+    )
+    astraTableEntries = Param.Unsigned(
+        1024,
+        "Entries of the ASTRA Last Address Table and of the Stride to"
+        " Stride table (a power of two, at most 65536)",
+    )
+    enableVCache = Param.Bool(
+        False,
+        "Enable the shadow value cache (V$, research prototype): a model of"
+        " the paper's value cache that is updated by retiring loads and"
+        " stores and checked against the real data, never used by the CPU",
+    )
+    enableVAstraDiag = Param.Bool(
+        False,
+        "Enable the diagnostic V-ASTRA probe (research prototype, needs"
+        " enableAstra and enableVCache): for loads with an ASTRA prediction,"
+        " what the shadow V$ would have supplied for the predicted base"
+        " address, compared with what the load read; never used by the CPU",
+    )
+    enableVAstraVerify = Param.Bool(
+        False,
+        "Strict shadow verification of V-ASTRA candidates (research"
+        " prototype, needs enableVAstraDiag): a candidate that passed every"
+        " check and is a byte-valid V$ hit must equal the bytes the real load"
+        " returns, or the run stops with a panic that reports the load; the"
+        " candidate is never used",
+    )
+    enableVAstraBypass = Param.Bool(
+        False,
+        "Stage 2b V-ASTRA bypass (research prototype, needs enableAstra,"
+        " enableVCache and enableVAstraDiag; excludes enableVAstraVerify and"
+        " vastraTestSkipStoreScan): a load whose ASTRA base is right, with a"
+        " byte-valid shadow V$ entry and no conflicting older store, is"
+        " completed by a synthetic LSQ response from the V$ without a memory"
+        " request",
+    )
+    vastraTestSkipSyscallFlush = Param.Bool(
+        False,
+        "TEST ONLY (needs enableVAstraDiag and enableVAstraBypass or"
+        " enableVAstraVerify): do not flush the shadow V$ at a committed"
+        " system call, to show that the stale bytes the flush prevents are"
+        " consumed or detected",
+    )
+    enableVAstraScoreboardRelease = Param.Bool(
+        False,
+        "Design A (research prototype, needs enableVAstraBypass): when a"
+        " load reaches the final V-ASTRA bypass success its destination"
+        " registers are released in the scoreboard, so that dependents can"
+        " issue before the load commits.  Only readiness changes: no value"
+        " is forwarded and nothing executes earlier.  Effective only when"
+        " loads are marked unpredictable at issue (memory FU"
+        " extraAssumedLat = 0, configs/research/vp_stall_on_use.py)",
+    )
+    enableVAstraForwarding = Param.Bool(
+        False,
+        "Design B (research prototype, needs enableVAstraBypass and"
+        " enableVAstraScoreboardRelease; excludes lvpSpecAddr): a load whose"
+        " only source is the result of a load that reached the final V-ASTRA"
+        " bypass success builds its effective address from that validated"
+        " value and sends its request before the producer commits; a"
+        " pending or failed producer is never used",
+    )
+    vastraTestSkipStoreScan = Param.Bool(
+        False,
+        "TEST ONLY (needs enableVAstraDiag): do not reject candidates"
+        " because of older stores in flight, to show that strict"
+        " verification detects the stale values the scan prevents",
+    )
     lvpConfThreshold = Param.Unsigned(
         3,
         "Confidence (1-3, 2-bit saturating counter) needed to make a"

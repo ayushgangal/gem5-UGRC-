@@ -48,9 +48,29 @@ namespace gem5
 namespace minor
 {
 
-/** Direct-mapped, PC-indexed last-value predictor with 2-bit saturating
- *  confidence counters.  A prediction is only returned once the counter
- *  has reached the configured threshold. */
+/** Direct-mapped, PC-indexed, untagged last-value predictor with 2-bit
+ *  saturating confidence counters (Ravenel et al., HPCA 2025, Table II:
+ *  "LVP": no tag, 2-bit confidence, 64-bit value, 2^n entries).
+ *
+ *  Different load PCs that map to the same entry share its value and its
+ *  confidence.  There is no tag and no valid bit.
+ *
+ *  Initialisation (an assumption of this model: the paper does not give
+ *  one): every entry starts with value 0 and confidence 0.  An entry that
+ *  has never been trained therefore cannot be confident at any threshold
+ *  of 1 or more, but it behaves as if it had last seen the value 0: an
+ *  observed 0 counts as a match and raises its confidence.
+ *
+ *  Confidence update (the paper: incremented on a correct prediction,
+ *  decremented on an incorrect one): on every training observation the
+ *  entry's stored value is compared with the observed value.  A match
+ *  increments the counter (saturating at 3), a mismatch decrements it
+ *  (saturating at 0), and the observed value is stored.  The counter is
+ *  updated whether or not a prediction was made or used, because an entry
+ *  below the threshold must be able to gain confidence.
+ *
+ *  A prediction is only returned once the counter has reached the
+ *  configured threshold; 3 (saturated) is the paper-aligned default. */
 class LastValuePredictor : public statistics::Group
 {
   public:
@@ -67,7 +87,8 @@ class LastValuePredictor : public statistics::Group
                        unsigned conf_threshold);
 
     /** Look up a prediction for an eligible load at pc.
-     *  @return true and set val only if the entry is confident. */
+     *  @return true and set val only if the entry (which pc shares with
+     *  every other pc that has the same index) is confident. */
     bool lookup(Addr pc, RegVal &val);
 
     /** Train the table with the actual value of an eligible load at pc. */
@@ -119,10 +140,9 @@ class LastValuePredictor : public statistics::Group
     uint64_t carryPred = 0;
     uint64_t carrySpec = 0;
 
+    /** One table entry: no tag and no valid bit */
     struct Entry
     {
-        bool valid = false;
-        Addr tag = 0;
         RegVal value = 0;
         uint8_t confidence = 0;
     };
@@ -131,7 +151,9 @@ class LastValuePredictor : public statistics::Group
     const uint64_t indexMask;
     const uint8_t confThreshold;
 
-    /** RISC-V instructions are at least 2-byte aligned */
+    /** RISC-V instructions are at least 2-byte aligned.  Two pcs alias
+     *  when they differ only above bit log2(entries) (that is, by a
+     *  multiple of 2 * entries bytes). */
     uint64_t index(Addr pc) const { return (pc >> 1) & indexMask; }
 
   public:

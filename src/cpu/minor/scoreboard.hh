@@ -144,6 +144,21 @@ class Scoreboard : public Named
      *  must match mark_unpredictable for the same inst. */
     void clearInstDests(MinorDynInstPtr inst, bool clear_unpredictable);
 
+    /** Release the unpredictable marks of inst's destination registers
+     *  before inst leaves the in-flight queue, so that instructions that
+     *  read those registers can issue (V-ASTRA scoreboard release).  Only
+     *  readiness, which Scoreboard::canInstIssue tests, changes: the
+     *  register file, numResults, writingInst (what execSeqNumToWaitFor
+     *  returns, and so when a dependent memory reference may read its
+     *  operands) and returnCycle are untouched.  The caller must not
+     *  call clearInstDests with clear_unpredictable afterwards.  Returns
+     *  the number of registers released. */
+    unsigned releaseUnpredictable(MinorDynInstPtr inst);
+
+    /** Unpredictable marks outstanding over all registers (0 when no
+     *  marked instruction is in flight) */
+    unsigned totalUnpredictable() const;
+
     /** Returns the exec sequence number of the most recent inst on
      *  which the given inst depends.  Useful for determining which
      *  inst must actually be committed before a dependent inst

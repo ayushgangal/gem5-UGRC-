@@ -37,13 +37,18 @@
 
 #include "cpu/minor/execute.hh"
 
+#include <algorithm>
+#include <cstring>
 #include <functional>
 
+#include "arch/riscv/insts/mem.hh"
+#include "base/bitfield.hh"
 #include "cpu/minor/cpu.hh"
 #include "cpu/minor/exec_context.hh"
 #include "cpu/minor/fetch1.hh"
 #include "cpu/minor/lsq.hh"
 #include "cpu/op_class.hh"
+#include "debug/ASTRA.hh"
 #include "debug/Activity.hh"
 #include "debug/Branch.hh"
 #include "debug/Drain.hh"
@@ -54,6 +59,9 @@
 #include "debug/MinorMem.hh"
 #include "debug/MinorTrace.hh"
 #include "debug/PCEvent.hh"
+#include "debug/VAstra.hh"
+#include "debug/VBypass.hh"
+#include "debug/VCache.hh"
 
 namespace gem5
 {
@@ -84,6 +92,15 @@ Execute::Execute(const std::string &name_,
     lvpSpecAddr(params.lvpSpecAddr),
     lvpSpecPcBegin(params.lvpSpecPcBegin),
     lvpSpecPcEnd(params.lvpSpecPcEnd),
+    enableAstra(params.enableAstra),
+    enableVCache(params.enableVCache),
+    enableVAstraDiag(params.enableVAstraDiag),
+    enableVAstraVerify(params.enableVAstraVerify),
+    enableVAstraBypass(params.enableVAstraBypass),
+    vastraSkipSyscallFlush(params.vastraTestSkipSyscallFlush),
+    vastraScoreboardRelease(params.enableVAstraScoreboardRelease),
+    vastraForwarding(params.enableVAstraForwarding),
+    vastraSkipStoreScan(params.vastraTestSkipStoreScan),
     noCostFUIndex(fuDescriptions.funcUnits.size() + 1),
     lsq(name_ + ".lsq", name_ + ".dcache_port",
         cpu_, *this,
@@ -126,6 +143,65 @@ Execute::Execute(const std::string &name_,
     if (enableLVP) {
         lvp = std::make_unique<LastValuePredictor>(&cpu_,
             params.lvpTableEntries, params.lvpConfThreshold);
+    }
+
+    if (enableAstra) {
+        astra = std::make_unique<AstraPredictor>(&cpu_,
+            params.astraTableEntries);
+    }
+
+    if (enableVCache) {
+        /* The V$ is indexed by virtual address and has no thread or
+         * process identifier */
+        fatal_if(params.numThreads != 1,
+            "%s: enableVCache requires a single thread (got %d)", name_,
+            params.numThreads);
+        vcache = std::make_unique<VCache>(&cpu_);
+    }
+
+    fatal_if((enableVAstraVerify || vastraSkipStoreScan) &&
+        !enableVAstraDiag,
+        "%s: enableVAstraVerify and vastraTestSkipStoreScan require "
+        "enableVAstraDiag", name_);
+
+    fatal_if(enableVAstraBypass && !(enableAstra && enableVCache &&
+        enableVAstraDiag),
+        "%s: enableVAstraBypass requires enableAstra, enableVCache and "
+        "enableVAstraDiag", name_);
+    fatal_if(enableVAstraBypass && enableVAstraVerify,
+        "%s: enableVAstraBypass and enableVAstraVerify are mutually "
+        "exclusive: strict verification compares a candidate with the "
+        "bytes a real memory request returns, and a bypassed load makes "
+        "none", name_);
+    fatal_if(vastraSkipSyscallFlush &&
+        !(enableVAstraDiag && (enableVAstraBypass || enableVAstraVerify)),
+        "%s: vastraTestSkipSyscallFlush is test-only fault injection and "
+        "needs enableVAstraDiag with enableVAstraBypass or "
+        "enableVAstraVerify", name_);
+    fatal_if(vastraScoreboardRelease && !enableVAstraBypass,
+        "%s: enableVAstraScoreboardRelease requires enableVAstraBypass "
+        "(and so enableAstra, enableVCache and enableVAstraDiag)", name_);
+    fatal_if(vastraForwarding && !(enableVAstraBypass &&
+        vastraScoreboardRelease),
+        "%s: enableVAstraForwarding requires enableVAstraBypass and "
+        "enableVAstraScoreboardRelease", name_);
+    fatal_if(vastraForwarding && lvpSpecAddr,
+        "%s: enableVAstraForwarding and lvpSpecAddr are mutually exclusive "
+        "in this stage", name_);
+    fatal_if(vastraForwarding && !allowEarlyMemIssue,
+        "%s: enableVAstraForwarding requires executeAllowEarlyMemoryIssue",
+        name_);
+    fatal_if(enableVAstraBypass && vastraSkipStoreScan,
+        "%s: vastraTestSkipStoreScan is test-only fault injection and must "
+        "not be combined with enableVAstraBypass", name_);
+
+    if (enableVAstraDiag) {
+        fatal_if(!enableAstra || !enableVCache,
+            "%s: enableVAstraDiag requires enableAstra and enableVCache",
+            name_);
+        vastra = std::make_unique<VAstraDiag>(&cpu_);
+        vastraStores.resize(params.numThreads);
+        vaFwdMap.resize(params.numThreads);
     }
 
     if (commitLimit < 1) {
@@ -392,6 +468,17 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
      * is checked before any response is acted on (the response could be a
      * translation fault or an error for a wrong address) and before
      * completeAcc, as the load can overwrite its own source register. */
+    /* The same for a forwarded V-ASTRA operand: the producer has committed
+     * by now, so the register holds its final value, which is what was
+     * published.  A difference is an internal error, never a recovery. */
+    if (inst->vaFwdState == VAFwdConsumer::Accepted) {
+        const RegVal arch_src = thread->getReg(
+            inst->staticInst->srcRegIdx(0));
+        panic_if(arch_src != inst->vaFwdSrcVal,
+            "V-ASTRA forwarding: load %s used source %#x but the register "
+            "holds %#x", *inst, inst->vaFwdSrcVal, arch_src);
+    }
+
     if (enableLVP && inst->lvpConsState == LVPConsumerState::Accepted) {
         const RegVal arch_src = thread->getReg(
             inst->staticInst->srcRegIdx(inst->lvpSpecSrcIdx));
@@ -451,6 +538,12 @@ Execute::handleMemResponse(MinorDynInstPtr inst,
             /* The loaded value is now in the register file */
             if (enableLVP && is_load && lvpEligibleProducer(inst))
                 lvp_recover = lvpValidateProducer(inst, thread);
+
+            /* This memory operation completed without a fault and is not
+             * discarded: it is retiring.  The shadow V$ observes it (and
+             * nothing else changes) */
+            if (enableVCache)
+                vcacheRetire(inst, response);
 
             /* Stores need to be pushed into the store buffer to finish
              *  them off */
@@ -553,6 +646,12 @@ Execute::executeMemRefInst(MinorDynInstPtr inst, BranchData &branch,
 
         DPRINTF(MinorExecute, "Initiating memRef inst: %s\n", *inst);
 
+        if (enableAstra)
+            astraCaptureBase(inst, thread);
+
+        if (enableVAstraDiag)
+            vastraDecide(inst);
+
         Fault init_fault = inst->staticInst->initiateAcc(&context,
             inst->traceData);
 
@@ -597,6 +696,19 @@ Execute::executeMemRefInst(MinorDynInstPtr inst, BranchData &branch,
                 DPRINTF(LVP, "Speculative load accepted inst: %s "
                     "producer: %d source: %#x\n", *inst,
                     inst->lvpSpecProducer, inst->lvpSpecSrcVal);
+            }
+
+            /* A load that built its request from a published V-ASTRA value
+             * is a forwarding consumer from here: it must reach an outcome */
+            if (vastraForwarding && inst->vaFwdActive && inst->inLSQ &&
+                inst->vaFwdState == VAFwdConsumer::None) {
+                inst->vaFwdState = VAFwdConsumer::Accepted;
+                vastra->fwdAdmittedOne();
+
+                DPRINTF(VBypass, "VBypass fwd admit exec: %d pc: 0x%x "
+                    "producer: %d value: 0x%x\n", inst->id.execSeqNum,
+                    inst->pc->instAddr(), inst->vaFwdProducer,
+                    inst->vaFwdSrcVal);
             }
 
             /* If the instruction didn't pass its predicate
@@ -862,12 +974,21 @@ Execute::issue(ThreadID thread_id)
                             cpu.getContext(thread_id),
                             issued_mem_ref && extra_assumed_lat == Cycles(0));
 
+                        inst->sbUnpredictable =
+                            issued_mem_ref && extra_assumed_lat == Cycles(0);
+
                         /* Push the instruction onto the inFlight queue so
                          *  it can be committed in order */
                         thread.inFlightInsts->push(fu_inst);
 
                         if (enableLVP)
                             lvpOnIssue(inst);
+
+                        if (enableAstra)
+                            astraOnIssue(inst);
+
+                        if (enableVAstraDiag)
+                            vastraOnIssue(inst);
 
                         issued = true;
                     }
@@ -1096,6 +1217,12 @@ Execute::commitInst(MinorDynInstPtr inst, bool early_memory_issue,
             DPRINTF(MinorExecute, "Fault in execute of inst: %s fault: %s\n",
                 *inst, fault->name());
             fault->invoke(thread, inst->staticInst);
+
+            /* The system call has run, its memory effects are complete
+             * and everything younger was or will be discarded (it is
+             * serialising: tryToBranch redirects) */
+            if (enableVCache && inst->staticInst->isSyscall())
+                vcacheSyscallFlush(inst);
         }
 
         doInstCommitAccounting(inst);
@@ -1160,6 +1287,31 @@ class LVPSpecOperandScope
 
     LVPSpecOperandScope(const LVPSpecOperandScope &) = delete;
     LVPSpecOperandScope &operator=(const LVPSpecOperandScope &) = delete;
+};
+
+/** The same for a V-ASTRA forwarded operand (Execute::vastraFwdAdmissible) */
+class VAFwdOperandScope
+{
+  private:
+    MinorDynInstPtr inst;
+    const bool active;
+
+  public:
+    VAFwdOperandScope(const MinorDynInstPtr &inst_, bool active_) :
+        inst(inst_), active(active_)
+    {
+        if (active)
+            inst->vaFwdActive = true;
+    }
+
+    ~VAFwdOperandScope()
+    {
+        if (active)
+            inst->vaFwdActive = false;
+    }
+
+    VAFwdOperandScope(const VAFwdOperandScope &) = delete;
+    VAFwdOperandScope &operator=(const VAFwdOperandScope &) = delete;
 };
 
 } // anonymous namespace
@@ -1246,6 +1398,9 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
          * address, and the predicted load that made the prediction */
         bool lvp_spec_admit = false;
         MinorDynInstPtr lvp_spec_producer;
+        /* The early memory issue builds its address from a published
+         * V-ASTRA value (Design B) */
+        bool va_fwd_admit = false;
 
         /* Must set this again to go around the loop */
         completed_inst = false;
@@ -1327,14 +1482,23 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                     lvpSpecAddr && lvpSpecAdmissible(ex_info, inst,
                         mem_response != NULL, fu_inst, head_mem_ref_inst);
 
+                const bool fwd_admit = !deps_satisfied && !spec_admit &&
+                    vastraForwarding && !fu_inst->isBubble() &&
+                    !fu_inst->inLSQ && fu_inst->canEarlyIssue &&
+                    ex_info.streamSeqNum == fu_inst->id.streamSeqNum &&
+                    vastraFwdAdmissible(ex_info, fu_inst, head_mem_ref_inst);
+
                 /* Use this, possibly out of order, inst as the one
                  *  to 'commit'/send to the LSQ */
                 if (!fu_inst->isBubble() &&
                     !fu_inst->inLSQ &&
                     fu_inst->canEarlyIssue &&
                     ex_info.streamSeqNum == fu_inst->id.streamSeqNum &&
-                    (deps_satisfied || spec_admit))
+                    (deps_satisfied || spec_admit || fwd_admit))
                 {
+                    if (fwd_admit)
+                        va_fwd_admit = true;
+
                     DPRINTF(MinorExecute, "Issuing mem ref early"
                         " inst: %s instToWaitFor: %d\n",
                         *(fu_inst), fu_inst->instToWaitFor);
@@ -1453,6 +1617,8 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                         {
                             LVPSpecOperandScope spec_operand(inst,
                                 lvp_spec_admit);
+                            VAFwdOperandScope fwd_operand(inst,
+                                va_fwd_admit);
 
                             completed_inst = commitInst(inst,
                                 early_memory_issue, branch, fault,
@@ -1548,6 +1714,19 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                     committed_inst);
             }
 
+            if (enableAstra) {
+                panic_if(inst != ex_info.inFlightInsts->front().inst,
+                    "ASTRA: completing %s but the head of the in flight "
+                    "queue is %s", *inst,
+                    *(ex_info.inFlightInsts->front().inst));
+
+                astraRetire(inst, discard_inst, fault != NoFault,
+                    committed_inst);
+            }
+
+            if (enableVAstraDiag)
+                vastraPop(inst, discard_inst, fault != NoFault);
+
             /* Finished with the inst, remove it from the inst queue and
              *  clear its dependencies */
             ex_info.inFlightInsts->pop();
@@ -1559,7 +1738,10 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                 lsq.completeMemBarrierInst(inst, committed_inst);
             }
 
-            scoreboard[thread_id].clearInstDests(inst, inst->isMemRef());
+            /* A V-ASTRA scoreboard release already removed this
+             * instruction's unpredictable marks */
+            scoreboard[thread_id].clearInstDests(inst,
+                inst->isMemRef() && !inst->vaScoreReleased);
         }
 
         /* Handle per-cycle instruction counting */
@@ -1626,6 +1808,115 @@ Execute::lvpEligibleConsumer(const MinorDynInstPtr &inst) const
     /* The base address is the only source */
     return inst->staticInst->numSrcRegs() == 1 &&
         inst->staticInst->srcRegIdx(0).is(IntRegClass);
+}
+
+bool
+Execute::vastraFwdProducer(const MinorDynInstPtr &inst) const
+{
+    if (!lvpEligibleProducer(inst))
+        return false;
+
+    const std::string name = inst->staticInst->getName();
+
+    return name == "ld" || name == "lw" || name == "lwu" || name == "lh" ||
+        name == "lhu" || name == "lb" || name == "lbu";
+}
+
+bool
+Execute::vastraRegValue(const MinorDynInstPtr &inst, const uint8_t *bytes,
+    unsigned size, RegVal &value) const
+{
+    const std::string name = inst->staticInst->getName();
+    unsigned want = 0;
+    bool sign = false;
+
+    if (name == "ld") { want = 8; }
+    else if (name == "lw") { want = 4; sign = true; }
+    else if (name == "lwu") { want = 4; }
+    else if (name == "lh") { want = 2; sign = true; }
+    else if (name == "lhu") { want = 2; }
+    else if (name == "lb") { want = 1; sign = true; }
+    else if (name == "lbu") { want = 1; }
+
+    if (want == 0 || size != want)
+        return false;
+
+    uint64_t v = 0;
+    for (unsigned i = 0; i < size; i++)
+        v |= uint64_t(bytes[i]) << (8 * i);
+
+    if (sign && size < 8 && (v >> (8 * size - 1)) & 1)
+        v |= ~uint64_t(0) << (8 * size);
+
+    value = v;
+    return true;
+}
+
+void
+Execute::vastraFwdFail(const MinorDynInstPtr &inst, const char *why)
+{
+    if (!vastraForwarding)
+        return;
+
+    auto &fmap = vaFwdMap[inst->id.threadId];
+    const auto it = fmap.find(inst->id.execSeqNum);
+
+    if (it == fmap.end() || it->second.state != VAFwdEntry::Pending)
+        return;
+
+    it->second.state = VAFwdEntry::Failed;
+    vastra->fwdRecordFailed();
+
+    DPRINTF(VBypass, "VBypass fwd fail exec: %d pc: 0x%x why: %s\n",
+        inst->id.execSeqNum, inst->pc->instAddr(), why);
+}
+
+bool
+Execute::vastraFwdAdmissible(const ExecuteThreadInfo &ex_info,
+    const MinorDynInstPtr &fu_inst, const MinorDynInstPtr &head_mem_ref_inst)
+{
+    if (!vastraForwarding || fu_inst->isBubble() ||
+        fu_inst != head_mem_ref_inst || !lvpEligibleConsumer(fu_inst) ||
+        fu_inst->vaFwdState != VAFwdConsumer::None) {
+        return false;
+    }
+
+    const ThreadID tid = fu_inst->id.threadId;
+    auto &fmap = vaFwdMap[tid];
+    const auto it = fmap.find(fu_inst->instToWaitFor);
+
+    if (it == fmap.end())
+        return false;
+
+    const VAFwdEntry &e = it->second;
+    auto *isa = cpu.getContext(tid)->getIsaPtr();
+    const RegId &src = fu_inst->staticInst->srcRegIdx(0);
+
+    /* The record must be the producer of this load's only source register,
+     * in this load's stream */
+    if (e.stream != fu_inst->id.streamSeqNum || e.destReg != src.flatten(*isa))
+        return false;
+
+    if (e.state != VAFwdEntry::Validated) {
+        const uint8_t bit = e.state == VAFwdEntry::Pending ? 1 : 2;
+
+        if (!(fu_inst->vaFwdWaited & bit)) {
+            fu_inst->vaFwdWaited |= bit;
+            vastra->fwdBlocked(bit == 1);
+
+            DPRINTF(VBypass, "VBypass fwd blocked exec: %d pc: 0x%x "
+                "producer: %d state: %s\n", fu_inst->id.execSeqNum,
+                fu_inst->pc->instAddr(), it->first,
+                bit == 1 ? "pending" : "failed");
+        }
+        return false;
+    }
+
+    (void)ex_info;
+    fu_inst->vaFwdProducer = it->first;
+    fu_inst->vaFwdSrcVal = e.value;
+    fu_inst->vaFwdSrcReg = src;
+    return true;
 }
 
 bool
@@ -1867,6 +2158,664 @@ Execute::lvpCheckOccupancy() const
         "LVP: %d predictions and %d speculative loads live but only %d "
         "instructions in flight", lvp->livePredictions(),
         lvp->liveSpecLoads(), occupied);
+}
+
+bool
+Execute::astraEligible(const MinorDynInstPtr &inst) const
+{
+    if (!inst->isInst())
+        return false;
+
+    const StaticInstPtr &si = inst->staticInst;
+    if (!si->isLoad() || si->isAtomic() || si->isStoreConditional() ||
+        si->isMicroop() || si->isSerializing() || si->isDataPrefetch()) {
+        return false;
+    }
+
+    /* On RISC-V the first source of these loads is the base register, and
+     * the effective address is the base plus a sign extended 12 bit
+     * immediate that is not predicted (see arch/riscv/isa/formats/mem.isa:
+     * EA = rvZext(Rs1 + offset)) */
+    return si->numSrcRegs() >= 1 && si->srcRegIdx(0).is(IntRegClass);
+}
+
+void
+Execute::astraOnIssue(const MinorDynInstPtr &inst)
+{
+    if (!astraEligible(inst))
+        return;
+
+    const AstraPredictor::LookupInfo info =
+        astra->lookup(inst->pc->instAddr());
+
+    inst->astraState = ASTRAState::Looked;
+    inst->astraPredBase = info.predBase;
+
+    DPRINTF(ASTRA, "ASTRA lookup tid: %d exec: %d pc: 0x%x index: %d "
+        "lat_base: 0x%x lat_idx: %d ss: %d pred: 0x%x\n",
+        inst->id.threadId, inst->id.execSeqNum, inst->pc->instAddr(),
+        info.index, info.latBase, info.latIdx, info.ssStride,
+        info.predBase);
+}
+
+void
+Execute::astraCaptureBase(const MinorDynInstPtr &inst, ThreadContext *thread)
+{
+    if (inst->astraState != ASTRAState::Looked)
+        return;
+
+    /* Under an LVP predicted source the register does not hold the real
+     * value yet: ASTRA is not meant to be combined with LVP address
+     * speculation in this stage, and such loads are not trained */
+    if (inst->lvpSpecActive)
+        return;
+
+    /* Called when the effective address is about to be computed from this
+     * register, so the register holds the base address (the instruction's
+     * own initiateAcc reads it the same way) */
+    /* Under a V-ASTRA forwarding override the instruction computes its
+     * address from the published (validated, final) value, which is what
+     * the register will hold: that is the base it actually uses */
+    inst->astraActualBase = inst->vaFwdActive ? inst->vaFwdSrcVal :
+        thread->getReg(inst->staticInst->srcRegIdx(0));
+    inst->astraBaseValid = true;
+
+    DPRINTF(ASTRA, "ASTRA base tid: %d exec: %d pc: 0x%x base: 0x%x\n",
+        inst->id.threadId, inst->id.execSeqNum, inst->pc->instAddr(),
+        inst->astraActualBase);
+}
+
+void
+Execute::astraRetire(const MinorDynInstPtr &inst, bool discarded,
+    bool faulted, bool committed)
+{
+    if (inst->astraState == ASTRAState::None)
+        return;
+
+    panic_if(inst->astraState == ASTRAState::Done,
+        "ASTRA: load classified twice: %s", *inst);
+    inst->astraState = ASTRAState::Done;
+
+    const ThreadID tid = inst->id.threadId;
+    const InstSeqNum exec = inst->id.execSeqNum;
+    const Addr pc = inst->pc->instAddr();
+
+    /* Precedence is discard, then fault, then commit, as for LVP */
+    if (discarded) {
+        astra->squashed();
+        DPRINTF(ASTRA, "ASTRA outcome tid: %d exec: %d pc: 0x%x "
+            "outcome: squashed\n", tid, exec, pc);
+    } else if (faulted) {
+        astra->faulted();
+        DPRINTF(ASTRA, "ASTRA outcome tid: %d exec: %d pc: 0x%x "
+            "outcome: faulted\n", tid, exec, pc);
+    } else {
+        panic_if(!committed, "ASTRA: looked up inst neither discarded, "
+            "faulted nor committed: %s", *inst);
+
+        if (!inst->astraBaseValid) {
+            astra->baseUnavailable();
+            DPRINTF(ASTRA, "ASTRA outcome tid: %d exec: %d pc: 0x%x "
+                "outcome: unavailable\n", tid, exec, pc);
+        } else {
+            const AstraPredictor::UpdateInfo info = astra->retire(pc,
+                inst->astraActualBase, inst->astraPredBase);
+
+            DPRINTF(ASTRA, "ASTRA update tid: %d exec: %d pc: 0x%x "
+                "base: 0x%x pred: 0x%x correct: %d index: %d "
+                "prev_base: 0x%x prev_idx: %d stride: %d new_idx: %d\n",
+                tid, exec, pc, inst->astraActualBase, inst->astraPredBase,
+                int(info.correct), info.index, info.prevBase, info.prevIdx,
+                info.stride, info.newIdx);
+        }
+    }
+}
+
+/** The bytes as hexadecimal text, lowest address first */
+static std::string
+vcacheHex(const uint8_t *data, unsigned size)
+{
+    static const char digits[] = "0123456789abcdef";
+    std::string text;
+
+    for (unsigned i = 0; i < size; i++) {
+        text += digits[data[i] >> 4];
+        text += digits[data[i] & 0xf];
+    }
+
+    return text;
+}
+
+void
+Execute::vcacheRetire(const MinorDynInstPtr &inst, LSQ::LSQRequestPtr response)
+{
+    const RequestPtr &req = response->request;
+    const PacketPtr &pkt = response->packet;
+    const StaticInstPtr &si = inst->staticInst;
+    const Addr vaddr = req->getVaddr();
+    const unsigned size = req->getSize();
+    const Addr pc = inst->pc->instAddr();
+    const InstSeqNum exec = inst->id.execSeqNum;
+    const bool is_load = response->isLoad;
+
+    /* A load completed from the V$ itself: its bytes are not an
+     * observation of memory, so neither the V$ nor the probe's lookups
+     * learn anything from it */
+    if (inst->vaBypassed) {
+        inst->vaState = VAstraState::Done;
+        vastra->retiredBypassed();
+        DPRINTF(VBypass, "VBypass retired exec: %d pc: 0x%x outcome: "
+            "bypassed vaddr: 0x%x size: %d\n", exec, pc, vaddr, size);
+        return;
+    }
+
+    /* Operations that the model cannot maintain exactly: any of them might
+     * modify memory (load-reserved and prefetches do not, but are treated
+     * the same, which only costs valid bytes) */
+    const bool special = si->isAtomic() || si->isDataPrefetch() ||
+        si->isMicroop() || req->isLLSC() || req->isSwap() ||
+        req->isCacheMaintenance() || req->isMasked() || size == 0 ||
+        !pkt->hasData() || pkt->getSize() != size;
+    const bool uncacheable = req->isUncacheable() ||
+        req->isStrictlyOrdered();
+
+    const char *kind = nullptr;
+    VCache::Reason reason = VCache::Reason::Special;
+
+    /* Decided below: is this an access the V$ model maintains as an
+     * ordinary one? (the diagnostic V-ASTRA probe needs to know) */
+
+    if (special) {
+        kind = "special";
+        reason = VCache::Reason::Special;
+    } else if (uncacheable) {
+        kind = is_load ? "uncacheable_load" : "uncacheable_store";
+        reason = VCache::Reason::Uncacheable;
+    } else if (!VCache::fitsInLine(vaddr, size)) {
+        kind = is_load ? "crossline_load" : "crossline_store";
+        reason = VCache::Reason::CrossLine;
+    }
+
+    if (enableVAstraDiag && inst->vaState == VAstraState::Candidate) {
+        const bool supported = !kind && is_load;
+        vastraValidate(inst, supported, vaddr, size,
+            supported ? pkt->getConstPtr<uint8_t>() : nullptr);
+    }
+
+    if (kind) {
+        const unsigned cleared = vcache->otherRetired(is_load, reason, vaddr,
+            size);
+
+        DPRINTF(VCache, "VCache other exec: %d pc: 0x%x vaddr: 0x%x size: "
+            "%d kind: %s invalidated: %d\n", exec, pc, vaddr, size, kind,
+            cleared);
+        return;
+    }
+
+    const std::string data = vcacheHex(pkt->getConstPtr<uint8_t>(), size);
+
+    if (is_load) {
+        static const char *lookups[] = {"tagmiss", "bytemiss", "correct",
+                                        "wrong"};
+        static const char *updates[] = {"allocate", "replace", "update"};
+        const VCache::LoadResult res = vcache->loadRetired(vaddr, size,
+            pkt->getConstPtr<uint8_t>());
+
+        DPRINTF(VCache, "VCache load exec: %d pc: 0x%x vaddr: 0x%x size: %d "
+            "data: %s lookup: %s update: %s\n", exec, pc, vaddr, size,
+            data, lookups[int(res.lookup)], updates[int(res.update)]);
+    } else {
+        const VCache::StoreResult res = vcache->storeRetired(vaddr, size,
+            pkt->getConstPtr<uint8_t>());
+
+        DPRINTF(VCache, "VCache store exec: %d pc: 0x%x vaddr: 0x%x size: "
+            "%d data: %s update: %s\n", exec, pc, vaddr, size, data,
+            res.update == VCache::Update::StoreUpdate ? "update" : "miss");
+    }
+}
+
+/** The effective address of an ordinary RISC-V load whose base register
+ *  holds base: base + the sign extended 12 bit immediate, which is the
+ *  decoded field machInst.imm12 (the ISA's own offset_code is offset =
+ *  sext<12>(IMM12), EA = rvZext(Rs1 + offset)).  False if the instruction
+ *  is not an uncompressed RISC-V Load. */
+static bool
+vastraEffectiveAddress(const MinorDynInstPtr &inst, Addr base, Addr &ea)
+{
+    const auto *load =
+        dynamic_cast<const RiscvISA::Load *>(inst->staticInst.get());
+
+    if (!load || load->machInst.compressed)
+        return false;
+
+    uint64_t sum = base + sext<12>(load->machInst.imm12);
+    if (load->machInst.rv_type == RiscvISA::RV32)
+        sum = static_cast<uint32_t>(sum);
+
+    ea = sum;
+    return true;
+}
+
+void
+Execute::vastraOnIssue(const MinorDynInstPtr &inst)
+{
+    if (!inst->isInst())
+        return;
+
+    const StaticInstPtr &si = inst->staticInst;
+    if (si->isStore() || si->isAtomic() || si->isStoreConditional())
+        vastraStores[inst->id.threadId].push_back(inst);
+}
+
+void
+Execute::vastraScanStores(const MinorDynInstPtr &inst, Addr ea,
+    unsigned size, bool &conflict, bool &unknown)
+{
+    /* Unknown addresses: a store is in vastraStores from its issue but gets
+     * memAddrKnown in LSQ::pushRequest.  Memory references are sent to the
+     * LSQ only from the front of inFUMemInsts (the oldest memory reference
+     * that has not been sent, see commit()), so when a load reaches
+     * executeMemRefInst every older memory reference has already been
+     * through it.  An older store without an address would need to have
+     * faulted before pushRequest, and the fault squashes this load.  So
+     * "unknown" is structurally unreachable here and at the LSQ; it is kept
+     * as a conservative check and counted (rejStoreUnknown, fbOlderStore),
+     * and no test builds the case. */
+    for (const MinorDynInstPtr &st : vastraStores[inst->id.threadId]) {
+        if (vastraSkipStoreScan ||
+            st->id.execSeqNum >= inst->id.execSeqNum) {
+            break;
+        }
+
+        if (!st->memAddrKnown)
+            unknown = true;
+        else if (st->memVaddr < ea + size &&
+                 ea < st->memVaddr + st->memSize)
+            conflict = true;
+    }
+}
+
+void
+Execute::vcacheSyscallFlush(const MinorDynInstPtr &inst)
+{
+    if (vastraSkipSyscallFlush) {
+        vcache->flushSkipped();
+        DPRINTF(VBypass, "VBypass syscall flush SKIPPED (test only) exec: "
+            "%d pc: 0x%x\n", inst->id.execSeqNum, inst->pc->instAddr());
+        return;
+    }
+
+    const unsigned bytes = vcache->flushAll();
+
+    DPRINTF(VBypass, "VBypass syscall flush exec: %d pc: 0x%x bytes: %d\n",
+        inst->id.execSeqNum, inst->pc->instAddr(), bytes);
+}
+
+bool
+Execute::vastraTryBypass(LSQ::LSQRequestPtr request, bool single)
+{
+    if (!enableVAstraBypass)
+        return false;
+
+    const MinorDynInstPtr &inst = request->inst;
+
+    /* Already sent back to memory (the send is being retried) */
+    if (inst->vaFellBack)
+        return false;
+
+    /* A load goes to memory for one reason, counted once */
+    auto fallback = [&](VAstraDiag::Fallback reason) {
+        inst->vaFellBack = true;
+        vastra->bypassFallback(reason);
+        vastraFwdFail(inst, "fallback");
+    };
+
+    /* Not looked up by ASTRA, or already classified: not a bypass load */
+    if (inst->vaState != VAstraState::Candidate &&
+        inst->vaState != VAstraState::Rejected) {
+        return false;
+    }
+
+    if (inst->vaState == VAstraState::Rejected) {
+        fallback(VAstraDiag::Fallback::DecisionRejected);
+        return false;
+    }
+
+    const RequestPtr &req = request->request;
+    const StaticInstPtr &si = inst->staticInst;
+    const Addr vaddr = req->getVaddr();
+    const unsigned size = req->getSize();
+
+    /* Same classification as vcacheRetire, on the request (the packet is
+     * still a read request here) */
+    const bool special = !single || !request->isLoad || !request->packet ||
+        si->isAtomic() || si->isDataPrefetch() || si->isMicroop() ||
+        req->isLLSC() || req->isSwap() || req->isCacheMaintenance() ||
+        req->isMasked() || size == 0 || request->packet->getSize() != size ||
+        !request->packet->isRead() || req->isUncacheable() ||
+        req->isStrictlyOrdered() || req->isLocalAccess();
+
+    if (special) {
+        fallback(VAstraDiag::Fallback::Unsupported);
+        return false;
+    }
+    if (!VCache::fitsInLine(vaddr, size)) {
+        fallback(VAstraDiag::Fallback::CrossLine);
+        return false;
+    }
+    if (inst->vaPredEa != vaddr) {
+        fallback(VAstraDiag::Fallback::EaMismatch);
+        return false;
+    }
+
+    /* The older stores again, now with the real size.  By now every older
+     * store has left the requests and transfers queues (so has updated the
+     * V$) or is in the store buffer (checked by the LSQ before this call).
+     * This scan cannot find what the decision's scan (size 8, the same
+     * stores, issue and address order fixed) did not: a store older than this
+     * load has its address and was listed at the decision, and addresses do
+     * not change.  fbOlderStore is therefore structurally unreachable (no
+     * test reaches it; run_bypass.sh "order" shows the ordering the
+     * argument rests on) and is kept as a defensive check: a store listed
+     * with an overlapping or unknown address is not trusted */
+    bool conflict = false, unknown = false;
+    vastraScanStores(inst, vaddr, size, conflict, unknown);
+    if (conflict || unknown) {
+        fallback(VAstraDiag::Fallback::OlderStore);
+        return false;
+    }
+
+    const unsigned off = vaddr & (VCache::lineBytes - 1);
+    const uint16_t want = mask(size) << off;
+
+    /* The snapshot of the decision must itself be a byte-valid hit */
+    if (!inst->vaTagHit) {
+        fallback(VAstraDiag::Fallback::TagMiss);
+        return false;
+    }
+    if ((inst->vaValid & want) != want) {
+        fallback(VAstraDiag::Fallback::ByteMiss);
+        return false;
+    }
+
+    /* A fresh lookup: retiring older loads and stores may have changed the
+     * entry since the decision.  The fresh bytes are used, and only if the
+     * entry still holds what the decision saw for the requested bytes */
+    const VCache::Snapshot fresh = vcache->snapshot(vaddr);
+    if (!fresh.tagHit || (fresh.valid & want) != want ||
+        !std::equal(fresh.data.begin() + off, fresh.data.begin() + off + size,
+                    inst->vaData + off)) {
+        inst->vaFellBack = true;
+        vastra->bypassAbandoned();
+        vastraFwdFail(inst, "abandoned");
+        DPRINTF(VBypass, "VBypass abandoned exec: %d pc: 0x%x vaddr: "
+            "0x%x\n", inst->id.execSeqNum, inst->pc->instAddr(), vaddr);
+        return false;
+    }
+
+    vastra->bypassEligible();
+
+    std::memcpy(request->packet->getPtr<uint8_t>(), fresh.data.data() + off,
+        size);
+    request->packet->makeResponse();
+    inst->vaBypassed = true;
+    vastra->bypassCompleted();
+
+    /* Final success: every check has passed and the response exists, so
+     * the load's result is fixed.  Dependents may now issue; their operand
+     * values are still read from the register file at their own commit or
+     * early memory issue, which wait for this load's commit (writingInst,
+     * instToWaitFor are not changed). */
+    if (vastraScoreboardRelease && inst->sbUnpredictable &&
+        !inst->vaScoreReleased) {
+        const unsigned regs =
+            scoreboard[inst->id.threadId].releaseUnpredictable(inst);
+
+        inst->vaScoreReleased = true;
+        vastra->scoreboardReleased(regs);
+
+        DPRINTF(VBypass, "VBypass release exec: %d pc: 0x%x regs: %d\n",
+            inst->id.execSeqNum, inst->pc->instAddr(), regs);
+    } else if (vastraScoreboardRelease) {
+        vastra->scoreboardReleased(0);
+    }
+
+    /* Design B: the value is now final, publish it for a dependent load.
+     * This is the only place a record becomes Validated, after every check
+     * has passed (never from the decision's snapshot). */
+    if (vastraForwarding) {
+        auto &fmap = vaFwdMap[inst->id.threadId];
+        const auto it = fmap.find(inst->id.execSeqNum);
+
+        if (it != fmap.end() && it->second.state == VAFwdEntry::Pending) {
+            RegVal value = 0;
+
+            if (vastraRegValue(inst, fresh.data.data() + off, size, value)) {
+                inst->vaRegValue = value;
+                inst->vaRegValid = true;
+                it->second.state = VAFwdEntry::Validated;
+                it->second.value = value;
+                vastra->fwdPublishedOne();
+
+                DPRINTF(VBypass, "VBypass fwd publish exec: %d pc: 0x%x "
+                    "value: 0x%x\n", inst->id.execSeqNum,
+                    inst->pc->instAddr(), value);
+            } else {
+                vastraFwdFail(inst, "notforwardable");
+            }
+        }
+    }
+
+    DPRINTF(VBypass, "VBypass exec: %d pc: 0x%x vaddr: 0x%x size: %d "
+        "data: %s (no memory request)\n", inst->id.execSeqNum,
+        inst->pc->instAddr(), vaddr, size,
+        vcacheHex(fresh.data.data() + off, size).c_str());
+    return true;
+}
+
+void
+Execute::vastraDecide(const MinorDynInstPtr &inst)
+{
+    /* No ASTRA prediction: no probe outcome.  A load can reach here twice
+     * (executed early, then again at the head after a fault): the first
+     * decision stands */
+    if (inst->astraState != ASTRAState::Looked ||
+        inst->vaState != VAstraState::None) {
+        return;
+    }
+
+    /* The longest access of an ordinary scalar load: the load's own size is
+     * not known until its request is built */
+    constexpr unsigned maxLoadBytes = 8;
+
+    VAstraDiag::Decision decision;
+    Addr ea = 0;
+    const char *text;
+
+    if (!inst->astraBaseValid) {
+        decision = VAstraDiag::Decision::MetadataMissing;
+        text = "metadata";
+    } else if (inst->astraPredBase != inst->astraActualBase) {
+        decision = VAstraDiag::Decision::BaseWrong;
+        text = "basewrong";
+    } else if (!vastraEffectiveAddress(inst, inst->astraPredBase, ea)) {
+        decision = VAstraDiag::Decision::MetadataMissing;
+        text = "metadata";
+    } else {
+        /* The older stores still in flight: any of them could change the
+         * bytes before this load reads them */
+        bool conflict = false, unknown = false;
+
+        vastraScanStores(inst, ea, maxLoadBytes, conflict, unknown);
+
+        if (conflict) {
+            decision = VAstraDiag::Decision::StoreConflict;
+            text = "storeconflict";
+        } else if (unknown) {
+            decision = VAstraDiag::Decision::StoreUnknown;
+            text = "storeunknown";
+        } else {
+            decision = VAstraDiag::Decision::Candidate;
+            text = "candidate";
+        }
+    }
+
+    if (decision == VAstraDiag::Decision::Candidate) {
+        const VCache::Snapshot snap = vcache->snapshot(ea);
+
+        inst->vaState = VAstraState::Candidate;
+        inst->vaPredEa = ea;
+        inst->vaTagHit = snap.tagHit;
+        inst->vaValid = snap.valid;
+        std::copy(snap.data.begin(), snap.data.end(), inst->vaData);
+
+        if (vastraForwarding && vastraFwdProducer(inst)) {
+            auto *isa = cpu.getContext(inst->id.threadId)->getIsaPtr();
+            VAFwdEntry &e = vaFwdMap[inst->id.threadId][inst->id.execSeqNum];
+
+            e = VAFwdEntry();
+            e.state = VAFwdEntry::Pending;
+            e.destReg = inst->staticInst->destRegIdx(0).flatten(*isa);
+            e.stream = inst->id.streamSeqNum;
+
+            DPRINTF(VBypass, "VBypass fwd create exec: %d pc: 0x%x\n",
+                inst->id.execSeqNum, inst->pc->instAddr());
+        }
+    } else {
+        inst->vaState = VAstraState::Rejected;
+    }
+
+    vastra->decided(decision);
+
+    DPRINTF(VAstra, "VAstra decide exec: %d pc: 0x%x result: %s pred_base: "
+        "0x%x actual_base: 0x%x pred_ea: 0x%x\n", inst->id.execSeqNum,
+        inst->pc->instAddr(), text, inst->astraPredBase,
+        inst->astraActualBase, ea);
+}
+
+void
+Execute::vastraPop(const MinorDynInstPtr &inst, bool discarded, bool faulted)
+{
+    auto &stores = vastraStores[inst->id.threadId];
+
+    if (!stores.empty() && stores.front() == inst) {
+        stores.pop_front();
+    } else {
+        const auto it = std::find(stores.begin(), stores.end(), inst);
+        if (it != stores.end())
+            stores.erase(it);
+    }
+
+    if (vastraForwarding) {
+        auto &fmap = vaFwdMap[inst->id.threadId];
+        const auto it = fmap.find(inst->id.execSeqNum);
+
+        if (it != fmap.end()) {
+            DPRINTF(VBypass, "VBypass fwd erase exec: %d pc: 0x%x state: "
+                "%s\n", inst->id.execSeqNum, inst->pc->instAddr(),
+                it->second.state == VAFwdEntry::Validated ? "validated" :
+                it->second.state == VAFwdEntry::Failed ? "failed" :
+                "pending");
+            fmap.erase(it);
+        }
+
+        if (inst->vaFwdState == VAFwdConsumer::Accepted) {
+            const int kind = discarded ? 1 : faulted ? 2 : 0;
+
+            vastra->fwdOutcome(kind);
+            inst->vaFwdState = VAFwdConsumer::Done;
+
+            DPRINTF(VBypass, "VBypass fwd outcome exec: %d pc: 0x%x "
+                "producer: %d outcome: %s\n", inst->id.execSeqNum,
+                inst->pc->instAddr(), inst->vaFwdProducer,
+                kind == 0 ? "committed" : kind == 1 ? "squashed" :
+                "faulted");
+        }
+    }
+
+    if (inst->vaState != VAstraState::Candidate)
+        return;
+
+    inst->vaState = VAstraState::Done;
+
+    /* A candidate that retired has been validated by vcacheRetire */
+    panic_if(!discarded && !faulted, "V-ASTRA probe: candidate %s left the "
+        "in flight queue without being validated", *inst);
+
+    if (discarded)
+        vastra->discarded();
+    else
+        vastra->faulted();
+
+    DPRINTF(VAstra, "VAstra outcome exec: %d pc: 0x%x outcome: %s\n",
+        inst->id.execSeqNum, inst->pc->instAddr(),
+        discarded ? "discarded" : "faulted");
+}
+
+void
+Execute::vastraValidate(const MinorDynInstPtr &inst, bool supported,
+    Addr vaddr, unsigned size, const uint8_t *data)
+{
+    VAstraDiag::Outcome outcome;
+    const char *text;
+
+    inst->vaState = VAstraState::Done;
+
+    if (!supported) {
+        outcome = VAstraDiag::Outcome::Unsupported;
+        text = "unsupported";
+    } else if (inst->vaPredEa != vaddr) {
+        outcome = VAstraDiag::Outcome::EaMismatch;
+        text = "eamismatch";
+    } else {
+        const unsigned off = vaddr & (VCache::lineBytes - 1);
+        const uint16_t want = mask(size) << off;
+
+        if (!inst->vaTagHit) {
+            outcome = VAstraDiag::Outcome::TagMiss;
+            text = "tagmiss";
+        } else if ((inst->vaValid & want) != want) {
+            outcome = VAstraDiag::Outcome::ByteMiss;
+            text = "bytemiss";
+        } else if (std::equal(data, data + size, inst->vaData + off)) {
+            outcome = VAstraDiag::Outcome::Correct;
+            text = "correct";
+        } else {
+            outcome = VAstraDiag::Outcome::Wrong;
+            text = "wrong";
+        }
+    }
+
+    vastra->retired(outcome);
+
+    /* Strict verification: a candidate that passed every check and is a
+     * byte-valid hit (the only candidate that would have been used) must
+     * be what the load really read.  Stops the run otherwise; a candidate
+     * rejected for any other reason, discarded or faulted is not checked.
+     * Nothing here changes what the load does */
+    if (enableVAstraVerify) {
+        if (outcome == VAstraDiag::Outcome::Correct) {
+            vastra->verified();
+        } else if (outcome == VAstraDiag::Outcome::Wrong) {
+            const unsigned off = vaddr & (VCache::lineBytes - 1);
+
+            panic("V-ASTRA verify: candidate differs from the load: exec: "
+                "%d pc: 0x%x pred_base: 0x%x actual_base: 0x%x ea: 0x%x "
+                "size: %d candidate: %s actual: %s", inst->id.execSeqNum,
+                inst->pc->instAddr(), inst->astraPredBase,
+                inst->astraActualBase, vaddr, size,
+                vcacheHex(inst->vaData + off, size).c_str(),
+                vcacheHex(data, size).c_str());
+        }
+    }
+
+    DPRINTF(VAstra, "VAstra outcome exec: %d pc: 0x%x outcome: %s vaddr: "
+        "0x%x size: %d actual: %s candidate: %s\n", inst->id.execSeqNum,
+        inst->pc->instAddr(), text, vaddr, size,
+        supported ? vcacheHex(data, size).c_str() : "-",
+        (supported && inst->vaPredEa == vaddr && inst->vaTagHit) ?
+        vcacheHex(inst->vaData + (vaddr & (VCache::lineBytes - 1)),
+                  size).c_str() : "-");
 }
 
 bool
@@ -2340,6 +3289,26 @@ Execute::isDrained()
         lvp->liveSpecLoads() != 0),
         "LVP: drained with %d predictions and %d speculative loads live",
         lvp->livePredictions(), lvp->liveSpecLoads());
+
+    for (ThreadID tid = 0; vastraForwarding && tid < vaFwdMap.size(); tid++) {
+        panic_if(!vaFwdMap[tid].empty(),
+            "V-ASTRA forwarding: drained with %d producer records",
+            vaFwdMap[tid].size());
+    }
+    panic_if(vastraForwarding && vastra->liveForwarded() != 0,
+        "V-ASTRA forwarding: drained with %d forwarded loads live",
+        vastra->liveForwarded());
+
+    for (ThreadID tid = 0; vastraScoreboardRelease && tid < scoreboard.size();
+         tid++) {
+        panic_if(scoreboard[tid].totalUnpredictable() != 0,
+            "V-ASTRA release: drained with %d unpredictable scoreboard "
+            "marks outstanding", scoreboard[tid].totalUnpredictable());
+    }
+
+    panic_if(enableVAstraDiag && vastra->liveCandidates() != 0,
+        "V-ASTRA probe: drained with %d candidates live",
+        vastra->liveCandidates());
 
     return true;
 }

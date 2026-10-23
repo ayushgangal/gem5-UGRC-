@@ -80,6 +80,9 @@ MinorCPU::MinorCPU(const BaseMinorCPUParams &params) :
     activityRecorder = pipeline->getActivityRecorder();
 
     fetchEventWrapper = NULL;
+
+    usesVCache = params.enableVCache || params.enableVAstraDiag ||
+        params.enableVAstraBypass;
 }
 
 MinorCPU::~MinorCPU()
@@ -102,6 +105,31 @@ MinorCPU::init()
     if (!params().switched_out && system->getMemoryMode() != enums::timing) {
         fatal("The Minor CPU requires the memory system to be in "
             "'timing' mode.\n");
+    }
+
+    /* The shadow V$ and the V-ASTRA bypass (execute.cc, vcache.hh) keep
+     * bytes by virtual address and are only kept coherent with what this
+     * one thread's own retired loads, stores and committed system calls do:
+     * there is no invalidation for a write by another CPU or thread.  What
+     * is enforced here, in init() when every CPU has been constructed, is:
+     * syscall emulation mode (not full system), and exactly one CPU object
+     * in the whole simulation (BaseCPU::cpuList, which includes switched out
+     * CPUs and CPUs of other systems, deliberately) with one hardware thread.
+     * Not detectable here, and so not guaranteed: a non-CPU agent (DMA
+     * device, traffic generator) that writes the same memory. */
+    if (usesVCache && !params().switched_out) {
+        fatal_if(FullSystem,
+            "%s: enableVCache/enableVAstraDiag/enableVAstraBypass are only "
+            "supported in syscall emulation mode (a full system has "
+            "devices, interrupts and other writers of memory)\n", name());
+        fatal_if(BaseCPU::numSimulatedCPUs() != 1,
+            "%s: enableVCache/enableVAstraDiag/enableVAstraBypass need "
+            "exactly one CPU in the simulation (found %d CPU objects): the "
+            "V$ is not kept coherent with another CPU's writes\n", name(),
+            BaseCPU::numSimulatedCPUs());
+        fatal_if(numThreads != 1,
+            "%s: enableVCache/enableVAstraDiag/enableVAstraBypass need a "
+            "single hardware thread (got %d)\n", name(), numThreads);
     }
 }
 

@@ -159,6 +159,14 @@ class ExecContext : public gem5::ExecContext
             return inst->lvpSpecSrcVal;
         }
 
+        /* Design B: a load whose producer's value was published by a final
+         * V-ASTRA bypass success sees that value for exactly that operand
+         * of exactly that instruction (see Execute::vastraFwdAdmissible) */
+        if (inst->vaFwdActive && idx == 0 &&
+            si == inst->staticInst.get() && reg == inst->vaFwdSrcReg) {
+            return inst->vaFwdSrcVal;
+        }
+
         return thread.getReg(reg);
     }
 

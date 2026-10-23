@@ -117,6 +117,10 @@ class MinorCPU : public BaseCPU
 
     /** Thread Scheduling Policy (RoundRobin, Random, etc) */
     enums::ThreadPolicy threadPolicy;
+
+    /** The shadow V$ (and so the V-ASTRA bypass) is enabled: init() then
+     *  checks the system, see MinorCPU::init */
+    bool usesVCache;
   protected:
      /** Return a reference to the data port. */
     Port &getDataPort() override;

@@ -30,6 +30,8 @@
 
 #include "base/intmath.hh"
 #include "base/logging.hh"
+#include "base/trace.hh"
+#include "debug/LVP.hh"
 
 namespace gem5
 {
@@ -106,7 +108,12 @@ LastValuePredictor::lookup(Addr pc, RegVal &val)
     ++stats.lookups;
 
     const Entry &e = table[index(pc)];
-    if (e.valid && e.tag == pc && e.confidence >= confThreshold) {
+    const bool confident = e.confidence >= confThreshold;
+
+    DPRINTFR(LVP, "table lookup pc: %#x index: %d value: %#x confidence: %d "
+        "confident: %d\n", pc, index(pc), e.value, e.confidence, confident);
+
+    if (confident) {
         val = e.value;
         ++stats.confidentPredictions;
         return true;
@@ -204,20 +211,23 @@ LastValuePredictor::train(Addr pc, RegVal actual)
     ++stats.trainings;
 
     Entry &e = table[index(pc)];
-    if (e.valid && e.tag == pc) {
-        if (e.value == actual) {
-            if (e.confidence < maxConfidence)
-                ++e.confidence;
-        } else {
-            e.value = actual;
-            e.confidence = 0;
-        }
-    } else {
-        e.valid = true;
-        e.tag = pc;
-        e.value = actual;
-        e.confidence = 0;
+    const uint8_t before = e.confidence;
+    const RegVal stored = e.value;
+
+    /* The stored value is compared with the observed one whether or not a
+     * prediction was made or used: an entry below the threshold must be
+     * able to gain confidence */
+    if (e.value == actual) {
+        if (e.confidence < maxConfidence)
+            ++e.confidence;
+    } else if (e.confidence > 0) {
+        --e.confidence;
     }
+    e.value = actual;
+
+    DPRINTFR(LVP, "table train pc: %#x index: %d stored: %#x actual: %#x "
+        "confidence: %d -> %d\n", pc, index(pc), stored, actual, before,
+        e.confidence);
 }
 
 } // namespace minor

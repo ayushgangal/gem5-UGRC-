@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Checks the outputs of run_lvp_stageb.sh.
-Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault|chain|threshold|
+Usage: check_lvp_stageb.py OUT [stable|phase|fanout|fault|chain|threshold|confidence|alias|
                                pcwindow|invalid-config]
 
 The workload is stable (every slot holds the same pointer, the default) or
@@ -2007,11 +2007,536 @@ def invalid_config_main(out):
     return 1 if fails else 0
 
 
+# ---------------------------------------------------------------------------
+# The predictor-policy tests: "confidence" and "alias" (lvp_policy.c)
+# ---------------------------------------------------------------------------
+
+POLICY_CONF_N = 48  # CONF_N of lvp_policy.c
+POLICY_ALIAS_TRAIN = 12  # ALIAS_TRAIN of lvp_policy.c
+POLICY_ENTRIES = 1024
+POLICY_MAX_CONF = 3
+POLICY_THRESHOLD = 3
+
+POLICY_CHECKSUMS = {
+    "confidence": POLICY_CONF_N * (1000 + 2000 + 1000),
+    "alias": POLICY_ALIAS_TRAIN * 111 * 2 + 222,
+}
+
+LOOKUP_RE = re.compile(
+    r"table lookup pc: (0x[0-9a-f]+) index: (\d+) value: (0x[0-9a-f]+|0) "
+    r"confidence: (\d+) confident: (\d)\s*$"
+)
+TRAIN_RE = re.compile(
+    r"table train pc: (0x[0-9a-f]+) index: (\d+) stored: (0x[0-9a-f]+|0) "
+    r"actual: (0x[0-9a-f]+|0) confidence: (\d+) -> (\d+)\s*$"
+)
+VALIDATED_RE = re.compile(
+    r"Validated inst: .* pc: (0x[0-9a-f]+) .*predicted: (0x[0-9a-f]+|0) "
+    r"actual: (0x[0-9a-f]+|0) \((correct|incorrect)\)"
+)
+
+
+def policy_index(pc):
+    """The table index of a load at pc, from the formula of
+    LastValuePredictor::index (not from the simulator's own output)"""
+    return (pc >> 1) & (POLICY_ENTRIES - 1)
+
+
+def read_policy_pcs(out):
+    """{label: pc} from OUT/policy_pcs.txt, written by the runner from the
+    binary's disassembly"""
+    pcs = {}
+    with open(os.path.join(out, "policy_pcs.txt")) as f:
+        for line in f:
+            label, pc = line.split()
+            pcs[label] = int(pc, 16)
+    return pcs
+
+
+def read_policy_events(path):
+    """The table lookups and trainings in the LVP debug log, in the order
+    that the simulator wrote them (the order that it did them in), as
+    ('lookup', pc, index, value, confidence, confident) and
+    ('train', pc, index, stored, actual, before, after); and the validated
+    predictions as (pc, predicted, actual, outcome)"""
+    events = []
+    validated = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = LOOKUP_RE.search(line)
+            if m:
+                events.append(
+                    (
+                        "lookup",
+                        int(m.group(1), 16),
+                        int(m.group(2)),
+                        int(m.group(3), 16),
+                        int(m.group(4)),
+                        int(m.group(5)),
+                    )
+                )
+                continue
+            m = TRAIN_RE.search(line)
+            if m:
+                events.append(
+                    (
+                        "train",
+                        int(m.group(1), 16),
+                        int(m.group(2)),
+                        int(m.group(3), 16),
+                        int(m.group(4), 16),
+                        int(m.group(5)),
+                        int(m.group(6)),
+                    )
+                )
+                continue
+            m = VALIDATED_RE.search(line)
+            if m:
+                validated.append(
+                    (
+                        int(m.group(1), 16),
+                        int(m.group(2), 16),
+                        int(m.group(3), 16),
+                        m.group(4),
+                    )
+                )
+    return events, validated
+
+
+class TableModel:
+    """A reference model of the last-value table, to replay the events with.
+
+    kind "paper": untagged, a match increments the 2-bit counter and a
+        mismatch decrements it, the actual value is stored (the current
+        implementation); entries start at value 0, confidence 0;
+    kind "reset": untagged, but a mismatch resets the counter to 0;
+    kind "tagged": what the implementation did before: a full-PC tag and a
+        valid bit, a mismatch resets the counter, and a PC that finds
+        another PC's entry replaces it with confidence 0.
+    """
+
+    def __init__(self, kind):
+        self.kind = kind
+        self.value = {}
+        self.conf = {}
+        self.tag = {}
+
+    def entry(self, idx, pc):
+        """(value, confidence) that a lookup of pc sees"""
+        if self.kind == "tagged" and self.tag.get(idx) != pc:
+            return (0, 0)
+        return (self.value.get(idx, 0), self.conf.get(idx, 0))
+
+    def lookup(self, idx, pc):
+        value, conf = self.entry(idx, pc)
+        return value, conf, conf >= POLICY_THRESHOLD
+
+    def train(self, idx, pc, actual):
+        """returns (stored value, confidence before, confidence after)"""
+        if self.kind == "tagged":
+            if self.tag.get(idx) != pc:
+                before = self.entry(idx, pc)
+                self.tag[idx] = pc
+                self.value[idx] = actual
+                self.conf[idx] = 0
+                return before[0], before[1], 0
+        stored = self.value.get(idx, 0)
+        before = self.conf.get(idx, 0)
+        if stored == actual:
+            after = min(before + 1, POLICY_MAX_CONF)
+        elif self.kind == "paper":
+            after = max(before - 1, 0)
+        else:
+            after = 0
+        self.value[idx] = actual
+        self.conf[idx] = after
+        return stored, before, after
+
+
+def replay(events, kind):
+    """Replays the events on a TableModel.  Returns (disagreements with the
+    logged events, [(event number, value, confidence, confident) of each
+    lookup as the model has it])."""
+    model = TableModel(kind)
+    bad = []
+    lookups = []
+    for n, ev in enumerate(events):
+        if ev[0] == "lookup":
+            _, pc, idx, value, conf, confident = ev
+            mv, mc, mt = model.lookup(idx, pc)
+            lookups.append((n, mv, mc, int(mt)))
+            if (value, conf, confident) != (mv, mc, int(mt)):
+                bad.append(n)
+        else:
+            _, pc, idx, stored, actual, before, after = ev
+            ms, mb, ma = model.train(idx, pc, actual)
+            if (stored, before, after) != (ms, mb, ma):
+                bad.append(n)
+    return bad, lookups
+
+
+def policy_common(out, mode):
+    """The checks both policy tests share.  Returns (stats, events,
+    validated, pcs) or None if the runs are not usable"""
+    names = ["A", "B", "CL"]
+
+    section("Preflight: every run completed and wrote its outputs")
+    stats, problems = preflight(out, names, ["B", "CL"])
+    if stats is None:
+        print()
+        print(
+            "%d preflight check(s) failed: nothing was compared"
+            % len(problems)
+        )
+        return None
+
+    section("Run configuration")
+    check_config(out, "A", {"enableLVP": "false"})
+    for n in ("B", "CL"):
+        check_config(
+            out,
+            n,
+            {
+                "enableLVP": "true",
+                "lvpSpecAddr": "false",
+                "lvpConfThreshold": str(POLICY_THRESHOLD),
+                "lvpTableEntries": str(POLICY_ENTRIES),
+            },
+        )
+
+    section("Architectural correctness")
+    want = POLICY_CHECKSUMS[mode]
+    for n in names:
+        check(checksum(out, n) == want, "%s: checksum is %d" % (n, want))
+    check(
+        filecmp.cmp(
+            os.path.join(out, "A", "trace.txt"),
+            os.path.join(out, "B", "trace.txt"),
+            shallow=False,
+        ),
+        "A and B: identical committed trace (prediction only changes "
+        "nothing architectural)",
+    )
+    non_lvp = {
+        n: {k: v for k, v in stats[n].items() if "cpu.lvp." not in k}
+        for n in ("A", "B")
+    }
+    check(
+        non_lvp["A"] == non_lvp["B"],
+        "A and B: identical statistics apart from cpu.lvp.",
+    )
+
+    pcs = read_policy_pcs(out)
+    events, validated = read_policy_events(
+        os.path.join(out, "CL", "trace.txt")
+    )
+    return stats, events, validated, pcs
+
+
+def policy_accounting(stats, events, validated):
+    """Cross-checks of the log against the statistics of CL, and the
+    lifecycle identity"""
+    section("Statistics against the log")
+    s = lvp(stats["CL"])
+    n_lookup = sum(1 for e in events if e[0] == "lookup")
+    n_conf = sum(1 for e in events if e[0] == "lookup" and e[5])
+    n_train = sum(1 for e in events if e[0] == "train")
+    check(
+        s["lookups"] == n_lookup,
+        "lookups statistic (%d) = lookup lines in the log (%d)"
+        % (s["lookups"], n_lookup),
+    )
+    check(
+        s["confidentPredictions"] == n_conf,
+        "confidentPredictions (%d) = confident lookup lines (%d)"
+        % (s["confidentPredictions"], n_conf),
+    )
+    check(
+        s["trainings"] == n_train,
+        "trainings (%d) = train lines (%d)" % (s["trainings"], n_train),
+    )
+    check(
+        s["correct"] + s["incorrect"] == len(validated),
+        "correct + incorrect (%d) = validated lines (%d)"
+        % (s["correct"] + s["incorrect"], len(validated)),
+    )
+    check(
+        s["confidentPredictions"] + s["predCarryIn"]
+        == s["correct"]
+        + s["incorrect"]
+        + s["predFaulted"]
+        + s["predSquashed"]
+        + s["predInFlight"],
+        "confident + carry-in = correct + incorrect + faulted + squashed "
+        "+ in flight",
+    )
+    check(
+        s["predInFlight"] == 0 and s["predCarryIn"] == 0,
+        "no prediction in flight at the end, none carried in",
+    )
+    check(
+        s["specLoadsIssued"] == 0,
+        "no speculative load (address speculation is off)",
+    )
+    report(
+        "lookups %d, confident %d, trainings %d, correct %d, incorrect %d, "
+        "squashed %d"
+        % (
+            n_lookup,
+            n_conf,
+            n_train,
+            s["correct"],
+            s["incorrect"],
+            s["predSquashed"],
+        )
+    )
+    return s
+
+
+def confidence_main(out):
+    """The confidence-counter test (see lvp_policy.c, POLICY_CONF).
+
+    The log of every table lookup and training of the one load is replayed
+    on a model of the paper's counter (match +1, mismatch -1, saturating at
+    0 and 3).  Every logged lookup and training must agree with it.  Then
+    the same events are replayed on a model that resets the counter on a
+    mismatch, and the two are compared where they must differ: the counter
+    after the value change, and when confident predictions of the new value
+    resume."""
+    res = policy_common(out, "confidence")
+    if res is None:
+        return 1
+    stats, events, validated, pcs = res
+    pc = pcs["load"]
+
+    section("Replay against the model of the table")
+    check(len(events) > 0, "the log has table events (%d)" % len(events))
+    check(
+        all(e[1] == pc and e[2] == policy_index(pc) for e in events),
+        "every event is for the one load, at index %d of the formula"
+        % policy_index(pc),
+    )
+    trains = [e for e in events if e[0] == "train"]
+    check(
+        len(trains) == 3 * POLICY_CONF_N,
+        "one training for each of the %d loads (got %d)"
+        % (3 * POLICY_CONF_N, len(trains)),
+    )
+    bad, lookups_paper = replay(events, "paper")
+    check(
+        not bad,
+        "every lookup and training agrees with the decrementing untagged "
+        "model (%d disagreements)" % len(bad),
+    )
+
+    section("The value change lowers the counter by one")
+    changes = [
+        i
+        for i, e in enumerate(events)
+        if e[0] == "train" and e[5] == POLICY_MAX_CONF and e[3] != e[4]
+    ]
+    check(
+        len(changes) >= 1,
+        "a training with saturated confidence sees a different value "
+        "(%d of them)" % len(changes),
+    )
+    if not changes:
+        return finish_policy()
+    first = changes[0]
+    ev = events[first]
+    check(
+        (ev[3], ev[4]) == (1000, 2000),
+        "the first such training replaces 1000 by 2000 (stored %d, "
+        "actual %d)" % (ev[3], ev[4]),
+    )
+    check(
+        ev[6] == POLICY_MAX_CONF - 1,
+        "its confidence goes from 3 to 2, not to 0 (3 -> %d)" % ev[6],
+    )
+    nxt = [e for e in events[first + 1 :] if e[0] == "train"][0]
+    check(
+        (nxt[3], nxt[4], nxt[5], nxt[6]) == (2000, 2000, 2, 3),
+        "the next training repeats 2000 and goes from 2 back to 3 "
+        "(%d -> %d)" % (nxt[5], nxt[6]),
+    )
+
+    section("When confident predictions resume (lookups after the change)")
+    _, lookups_reset = replay(events, "reset")
+
+    def resume(lookups, source):
+        """(lookups, trainings) after the change and before the first
+        confident lookup of the new value.  The table is read at issue and
+        trained at commit, so lookups run ahead of the trainings; the number
+        of trainings is the measure that does not depend on that lag.
+        source is the log itself or a model of it."""
+        n_lookups = 0
+        for k, mv, mc, mt in lookups:
+            if k < first:
+                continue
+            if source == "log":
+                _, _, _, value, conf, confident = events[k]
+                got = (value, confident)
+            else:
+                got = (mv, mt)
+            if got[1] and got[0] == 2000:
+                n_trains = sum(
+                    1 for e in events[first + 1 : k] if e[0] == "train"
+                )
+                return n_lookups, n_trains
+            n_lookups += 1
+        return None, None
+
+    r_log = resume(lookups_paper, "log")
+    r_paper = resume(lookups_paper, "model")
+    r_reset = resume(lookups_reset, "model")
+    report(
+        "after the change, before the first confident prediction of 2000 "
+        "(lookups, trainings): log %s, decrementing model %s, resetting "
+        "model %s" % (r_log, r_paper, r_reset)
+    )
+    check(
+        r_log[1] is not None and r_log == r_paper,
+        "the log resumes exactly where the decrementing model does",
+    )
+    check(
+        r_log[1] == 1,
+        "after one more matching training (2 -> 3), not three "
+        "(%s trainings)" % (r_log[1],),
+    )
+    check(
+        r_reset[1] is None or (r_log[1] is not None and r_log[1] < r_reset[1]),
+        "earlier than a counter that is reset on a mismatch would "
+        "(%s < %s trainings)" % (r_log[1], r_reset[1]),
+    )
+    low = [
+        events[k]
+        for k, mv, mc, mt in lookups_paper
+        if k > first and events[k][4] == 2
+    ]
+    check(
+        len(low) >= 1 and all(not e[5] for e in low),
+        "a lookup sees the lowered confidence 2 and is not confident "
+        "(%d such lookups)" % len(low),
+    )
+    check(
+        r_log[0] == 1,
+        "with every lookup after the earlier trainings, one lookup is lost "
+        "to the lowered counter and the next is confident (%s lookups)"
+        % (r_log[0],),
+    )
+
+    policy_accounting(stats, events, validated)
+    section("Predictions used before the change was seen")
+    s = lvp(stats["CL"])
+    check(
+        s["incorrect"] >= 1,
+        "at least one confident prediction is validated incorrect "
+        "(%d): the change is seen after loads were predicted" % s["incorrect"],
+    )
+    return finish_policy()
+
+
+def alias_main(out):
+    """The untagged-table test (see lvp_policy.c, POLICY_ALIAS)."""
+    res = policy_common(out, "alias")
+    if res is None:
+        return 1
+    stats, events, validated, pcs = res
+    pa, pb = pcs["ld_a"], pcs["ld_b"]
+
+    section("The two loads alias (from the formula)")
+    check(pa != pb, "ld_a %#x and ld_b %#x are different loads" % (pa, pb))
+    check(
+        policy_index(pa) == policy_index(pb),
+        "(pc >> 1) & %d is %d for both"
+        % (POLICY_ENTRIES - 1, policy_index(pa)),
+    )
+    check(
+        all(e[2] == policy_index(e[1]) for e in events),
+        "every logged index is the formula's",
+    )
+    check(
+        {e[1] for e in events} == {pa, pb},
+        "the log has events only for these two loads",
+    )
+
+    section("Replay against the model of the table")
+    bad, _ = replay(events, "paper")
+    check(
+        not bad,
+        "every lookup and training agrees with the untagged model "
+        "(%d disagreements)" % len(bad),
+    )
+    bad_tagged, _ = replay(events, "tagged")
+    check(
+        len(bad_tagged) > 0,
+        "and the model of the previous, tagged table disagrees with the "
+        "log in %d events: the test tells them apart" % len(bad_tagged),
+    )
+
+    section("One load uses what the other trained")
+    lb = [i for i, e in enumerate(events) if e[0] == "lookup" and e[1] == pb]
+    tb = [i for i, e in enumerate(events) if e[0] == "train" and e[1] == pb]
+    check(len(lb) == 1 and len(tb) == 1, "ld_b runs once")
+    if len(lb) != 1 or len(tb) != 1:
+        return finish_policy()
+    look = events[lb[0]]
+    check(
+        look[5] == 1 and look[4] == POLICY_MAX_CONF and look[3] == 111,
+        "ld_b's lookup is confident (confidence %d) with ld_a's value %d, "
+        "which only ld_a has trained" % (look[4], look[3]),
+    )
+    check(
+        any(
+            v[0] == pb and v[1] == 111 and v[2] == 222 and v[3] == "incorrect"
+            for v in validated
+        ),
+        "ld_b's prediction 111 is validated against its real value 222 "
+        "(incorrect)",
+    )
+    tr = events[tb[0]]
+    check(
+        (tr[3], tr[4], tr[5], tr[6]) == (111, 222, 3, 2),
+        "ld_b's training sees ld_a's entry (stored %d, actual %d) and lowers "
+        "its confidence %d -> %d" % (tr[3], tr[4], tr[5], tr[6]),
+    )
+    after = [e for e in events[tb[0] + 1 :] if e[0] == "lookup" and e[1] == pa]
+    check(len(after) > 0, "ld_a runs again after ld_b")
+    if after:
+        e = after[0]
+        check(
+            e[4] == 2 and e[5] == 0 and e[3] == 222,
+            "ld_a's next lookup sees ld_b's training: value %d, confidence "
+            "%d, not confident (a tagged table would still be confident)"
+            % (e[3], e[4]),
+        )
+
+    policy_accounting(stats, events, validated)
+    return finish_policy()
+
+
+def finish_policy():
+    print()
+    print(
+        "%d correctness check(s) failed" % len(fails)
+        if fails
+        else "all correctness checks passed"
+    )
+    return 1 if fails else 0
+
+
 def main():
     if len(sys.argv) not in (2, 3) or (
         len(sys.argv) == 3
         and sys.argv[2] not in EXPECTED_CHECKSUMS
-        and sys.argv[2] not in ("threshold", "pcwindow", "invalid-config")
+        and sys.argv[2]
+        not in (
+            "threshold",
+            "pcwindow",
+            "invalid-config",
+            "confidence",
+            "alias",
+        )
     ):
         print(__doc__)
         return 2
@@ -2022,6 +2547,10 @@ def main():
         return pcwindow_main(out)
     if len(sys.argv) == 3 and sys.argv[2] == "invalid-config":
         return invalid_config_main(out)
+    if len(sys.argv) == 3 and sys.argv[2] == "confidence":
+        return confidence_main(out)
+    if len(sys.argv) == 3 and sys.argv[2] == "alias":
+        return alias_main(out)
     workload = sys.argv[2] if len(sys.argv) == 3 else "stable"
     expected_checksum = EXPECTED_CHECKSUMS[workload]
     names = ["A", "B", "C", "CL"]
